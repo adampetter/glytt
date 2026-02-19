@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ESP-IDF: Flash + Monitor (UART)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "idf.py -p ${config:idf.portWin} flash monitor"
+    }
+  ]
+}
