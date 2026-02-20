@@ -195,7 +195,7 @@ Byte Spi::Transfer(Byte *data, size_t length)
     memset(&transaction, 0, sizeof(transaction));
 
     transaction.tx_buffer = data;
-    transaction.length = length * BITS_PER_Byte;
+    transaction.length = length * BITS_PER_BYTE;
 
     if (this->lines == SpiLines::SpiLines_Quad)
         transaction.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_MODE_DIOQIO_ADDR;
@@ -221,13 +221,13 @@ int Spi::Receive(Byte *output, unsigned int length, unsigned int timeout)
         spi_slave_transaction_t transaction;
         memset(&transaction, 0, sizeof(transaction));
 
-        transaction.length = length * BITS_PER_Byte;
+        transaction.length = length * BITS_PER_BYTE;
         transaction.rx_buffer = (void *)output;
         transaction.user = &this->slaveConfig.handshake;
 
         ESP_ERROR_CHECK(spi_slave_transmit((spi_host_device_t)this->slaveConfig.bus, &transaction, timeout));
 
-        return transaction.trans_len / BITS_PER_Byte;
+        return transaction.trans_len / BITS_PER_BYTE;
     }
     else
     {
@@ -254,7 +254,7 @@ int Spi::Receive(Byte *output, unsigned int length, unsigned int timeout)
 
         // printf("Done\n");
 
-        return transactionPtr->trans_len / BITS_PER_Byte;
+        return transactionPtr->trans_len / BITS_PER_BYTE;
     }
 }
 

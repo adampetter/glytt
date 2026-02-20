@@ -6,11 +6,11 @@
 #include "api/navigation/coordinate.h"
 
 struct Location{
-    bool fix;
-    Byte satellites;
-    Vector2 coordinate;
-    DateTime datetime;
-    float altitude;
-    float speed;
-    double course;
+    bool fix = false;
+    Byte satellites = 0;
+    Vector2 coordinate = Vector2::Zero();
+    DateTime datetime = DateTime::Now();
+    float altitude = 0.0f;
+    float speed = 0.0f;
+    double course = 0.0;
 };

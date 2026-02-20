@@ -1,9 +1,9 @@
 #pragma once
 
 #include "api/navigation/location.h"
+#include "api/system/driver.h"
 
-
-class Gps
+class Gps : public Driver
 {
 public:
     Gps();

@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "api/motion/lis3dh.h"
 #include "api/navigation/pa1010d.h"
+#include "api/transmission/e22900t30s.h"
 #include "api/common/time.h"
 
 // Main entry point
@@ -20,7 +21,7 @@ extern "C" void app_main(void)
     Gpio::Mode((GpioNum)14, GpioMode::GpioMode_Output);
     Gpio::Write((GpioNum)14, false);
 
-    delay(5000);
+    delay(1000);
 
     const PA1010DConfig gpsConfig = {
         .i2c = i2c,
@@ -29,7 +30,30 @@ extern "C" void app_main(void)
 
     PA1010D *gps = new PA1010D(gpsConfig);
 
-    delay(3000);
+    delay(500);
+
+    const E22900T30SConfig transceiverConfig = {
+        .serial = {
+            .uart = new Uart({
+                .port = UartPort::UartPort_1,
+                .baudRate = UartBaudrate::UartBaudrate_9600,
+                .tx = (GpioNum)6,
+                .rx = (GpioNum)5,
+            }),
+            .baudRate = UartBaudrate::UartBaudrate_9600,
+            .parity = E22900T30SSerialParity::Parity_8N1},
+        .interupt = {.aux = (GpioNum)4, .expander = NULL},
+        .mode = {.m0 = (GpioNum)15, .m1 = (GpioNum)7, .expander = NULL},
+        .network = {.id = 0, .address = 0, .airDataRate = E22900T30SAirDataRate::Rate_2400, .subPacketSize = E22900T30SSubPacketSize::Size_240b, .power = E22900T30SPower::Power_30dBm, .ambientNoise = E22900T30SRSSIAmbientNoise::AmbientNoise_Disable}};
+
+    E22900T30S *transceiver = new E22900T30S(transceiverConfig);
+
+    delay(500);
+
+    transceiver->Send((Byte *)"Hello, World!", 13);
+    printf("Message sent: Hello, World!\n");
+
+    delay(500);
 
     const Lis3dhConfig config = {
         .i2c = i2c,
@@ -79,7 +103,7 @@ extern "C" void app_main(void)
             Gpio::Write((GpioNum)14, false);
         }
 
-        printf("Delta: X=%d, Y=%d, Z=%d, MovementSq=%lld\n", delta.X, delta.Y, delta.Z, movementSquared);
+        // printf("Delta: X=%d, Y=%d, Z=%d, MovementSq=%lld\n", delta.X, delta.Y, delta.Z, movementSquared);
 
         if (elapsedTime >= 3000)
         {

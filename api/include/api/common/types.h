@@ -6,8 +6,8 @@
 #define DEVELOPMENT true
 
 #define MS_PER_SECOND 1000
-#define BITS_PER_Byte 8
-#define Byte_MAX_VAL 255
+#define BITS_PER_BYTE 8
+#define BYTE_MAX_VAL 255
 #define PIN GPIO
 #define GPIO_NONE -1
 #define PIXEL_MAX USHRT_MAX

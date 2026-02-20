@@ -103,14 +103,30 @@ void PA1010D::Read(Location *location)
 
     if (this->gga.Valid() && this->rmc.Valid())
     {
+        const bool hasFix = this->gga.fixQualityIndicator > 0 && this->rmc.status == 'A';
+
         location->datetime = rmc.datetime;
-        location->coordinate = rmc.location;
         location->satellites = gga.satellites;
-        location->altitude = gga.altitude;
-        location->speed = rmc.speed * 1.852; // Convert from knots to kph
-        location->course = rmc.course;
-        location->fix = true;
-    }else{
+        location->fix = hasFix;
+
+        if (hasFix)
+        {
+            location->coordinate = rmc.location;
+            location->altitude = gga.altitude;
+            location->speed = rmc.speed * 1.852; // Convert from knots to kph
+            location->course = rmc.course;
+        }
+        else
+        {
+            location->coordinate = Vector2::Zero();
+            location->altitude = 0;
+            location->speed = 0;
+            location->course = 0;
+        }
+    }
+    else
+    {
+        location->coordinate = Vector2::Zero();
         location->satellites = 0;
         location->altitude = 0;
         location->speed = 0;
