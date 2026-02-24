@@ -3,11 +3,11 @@
 #include <unordered_map>
 #include <string>
 
-template <typename TKey, typename TValue>
+template <typename TKey, typename TValue, typename Hash = std::hash<TKey>, typename Equal = std::equal_to<TKey>>
 class Dictionary
 {
 private:
-    std::unordered_map<TKey, TValue> items;
+    std::unordered_map<TKey, TValue, Hash, Equal> items;
 
 public:
     Dictionary() {}

@@ -1,10 +1,10 @@
-#include "api/transmission/e22900t30s.h"
+#include "api/transmission/e22900t30.h"
 #include "api/common/time.h"
 #include "api/io/gpio.h"
 #include "api/common/utility.h"
 #include <cstring>
 
-E22900T30S::E22900T30S(const E22900T30SConfig &config)
+E22900T30::E22900T30(const E22900T30Config &config)
 {
     this->config = config;
     this->uart = config.serial.uart;
@@ -12,7 +12,7 @@ E22900T30S::E22900T30S(const E22900T30SConfig &config)
     if (this->uart == NULL)
     {
 #if DEBUG
-        printf("(E22900T30S) Undefined Uart\n");
+        printf("(E22900T30) Undefined Uart\n");
 #endif
         standStill();
     }
@@ -21,7 +21,7 @@ E22900T30S::E22900T30S(const E22900T30SConfig &config)
     if (this->config.interupt.aux == GPIO_NONE)
     {
 #if DEBUG
-        printf("(E22900T30S) Undefined aux pin\n");
+        printf("(E22900T30) Undefined aux pin\n");
 #else
         standStill();
 #endif
@@ -33,7 +33,7 @@ E22900T30S::E22900T30S(const E22900T30SConfig &config)
     if (this->config.mode.m0 == GPIO_NONE || this->config.mode.m1 == GPIO_NONE)
     {
 #if DEBUG
-        printf("(E22900T30S) Undefined mode pin\n");
+        printf("(E22900T30) Undefined mode pin\n");
 #else
         standStill();
 #endif
@@ -46,9 +46,9 @@ E22900T30S::E22900T30S(const E22900T30SConfig &config)
     }
 
     // Start mode
-    mode(E22900T30SMode::Mode_Normal);
+    mode(E22900T30Mode::Mode_Normal);
 
-    E22900T30SConfig tmp;
+    E22900T30Config tmp;
     bool result = registry(&tmp);
 
     if (result)
@@ -58,29 +58,29 @@ E22900T30S::E22900T30S(const E22900T30SConfig &config)
     this->uart->Flush();
 }
 
-E22900T30S::~E22900T30S()
+E22900T30::~E22900T30()
 {
     if (this->uart)
         delete this->uart;
 }
 
-unsigned long long E22900T30S::freq(Byte channel)
+unsigned long long E22900T30::freq(Byte channel)
 {
     return 850125000 + channel * 1000000;
 }
 
 // Reads registry from module and outputs values to config reference. Returns true if successful.
-bool E22900T30S::registry(E22900T30SConfig *output)
+bool E22900T30::registry(E22900T30Config *output)
 {
 #if DEBUG
-    printf("(E22900T30S) Reading registry...");
+    printf("(E22900T30) Reading registry...");
 #endif
 
     bool success = false;
     unsigned char attempts = 6;
 
     Byte parameters[10] = {0};
-    mode(E22900T30SMode::Mode_Config);
+    mode(E22900T30Mode::Mode_Config);
 
     do
     {
@@ -95,23 +95,23 @@ bool E22900T30S::registry(E22900T30SConfig *output)
         parameters[2] = 0x07;
         this->uart->Write(parameters, 3);
         memset(parameters, 0, 10);
-        delay(E22900T30S_WAIT);
+        delay(E22900T30_WAIT);
 
         int received = 0;
         long int start = millis();
-        while (received < (int)sizeof(parameters) && (millis() - start) < E22900T30S_TIMEOUT)
+        while (received < (int)sizeof(parameters) && (millis() - start) < E22900T30_TIMEOUT)
         {
             int count = this->uart->Read((Byte *)&parameters[received], (Byte)(sizeof(parameters) - received));
             if (count > 0)
                 received += count;
             else
-                delay(E22900T30S_WAIT);
+                delay(E22900T30_WAIT);
         }
 
         if (received < (int)sizeof(parameters))
         {
 #ifdef DEBUG
-            printf("(E22900T30S) Error: Failed to read from registry (%d/%d bytes)\n", received, (int)sizeof(parameters));
+            printf("(E22900T30) Error: Failed to read from registry (%d/%d bytes)\n", received, (int)sizeof(parameters));
             printf("Printing parameters:\n");
 
             for (int i = 0; i < 10; i++)
@@ -121,7 +121,7 @@ bool E22900T30S::registry(E22900T30SConfig *output)
 #endif
         }
 
-        mode(E22900T30SMode::Mode_Normal);
+        mode(E22900T30Mode::Mode_Normal);
 
         if (parameters[0] == 0xC1 && parameters[1] == 0x00 && parameters[2] == 0x07)
         {
@@ -130,24 +130,24 @@ bool E22900T30S::registry(E22900T30SConfig *output)
 
             Byte reg0 = parameters[6];
             output->serial.baudRate = (UartBaudrate)((reg0 >> 5) << 5);
-            output->serial.parity = (E22900T30SSerialParity)((((unsigned char)(reg0 << 3)) >> 6) << 3);
-            output->network.airDataRate = (E22900T30SAirDataRate)(((unsigned char)(reg0 << 5)) >> 5);
+            output->serial.parity = (E22900T30SerialParity)((((unsigned char)(reg0 << 3)) >> 6) << 3);
+            output->network.airDataRate = (E22900T30AirDataRate)(((unsigned char)(reg0 << 5)) >> 5);
 
             Byte reg1 = parameters[7];
-            output->network.subPacketSize = (E22900T30SSubPacketSize)((reg1 >> 5) << 5);
-            output->network.ambientNoise = (E22900T30SRSSIAmbientNoise)((((unsigned char)(reg1 << 2)) >> 7) << 5);
-            output->network.power = (E22900T30SPower)((unsigned char)(reg1 << 6) >> 6);
+            output->network.subPacketSize = (E22900T30SubPacketSize)((reg1 >> 5) << 5);
+            output->network.ambientNoise = (E22900T30RSSIAmbientNoise)((((unsigned char)(reg1 << 2)) >> 7) << 5);
+            output->network.power = (E22900T30Power)((unsigned char)(reg1 << 6) >> 6);
 
             Byte reg2 = parameters[8];
             output->network.channel = reg2;
 
             Byte reg3 = parameters[9];
-            output->network.rssi = (E22900T30SRSSI)((reg3 >> 7) << 7);
-            output->network.txmode = (E22900T30STransmissionMode)((((unsigned char)(reg3 << 1)) >> 7) << 6);
-            output->network.reply = (E22900T30SReply)((((unsigned char)(reg3 << 2)) >> 7) << 5);
-            output->network.lbt = (E22900T30SLBT)((((unsigned char)(reg3 << 3)) >> 7) << 4);
-            output->wor.mode = (E22900T30SWakeOnRadio)((((unsigned char)(reg3 << 4)) >> 7) << 3);
-            output->wor.interval = (E22900T30SWakeOnRadioInterval)(((unsigned char)(reg3 << 5)) >> 5);
+            output->network.rssi = (E22900T30RSSI)((reg3 >> 7) << 7);
+            output->network.txmode = (E22900T30TransmissionMode)((((unsigned char)(reg3 << 1)) >> 7) << 6);
+            output->network.reply = (E22900T30Reply)((((unsigned char)(reg3 << 2)) >> 7) << 5);
+            output->network.lbt = (E22900T30LBT)((((unsigned char)(reg3 << 3)) >> 7) << 4);
+            output->wor.mode = (E22900T30WakeOnRadio)((((unsigned char)(reg3 << 4)) >> 7) << 3);
+            output->wor.interval = (E22900T30WakeOnRadioInterval)(((unsigned char)(reg3 << 5)) >> 5);
             success = true;
             break;
         }
@@ -155,7 +155,7 @@ bool E22900T30S::registry(E22900T30SConfig *output)
         {
 #ifdef DEBUG
             if (attempts > 0)
-                printf("(E22900T30S) Error: Wrong registry response\n Retrying...\n");
+                printf("(E22900T30) Error: Wrong registry response\n Retrying...\n");
 #endif
             wait(100);
             attempts--;
@@ -165,7 +165,7 @@ bool E22900T30S::registry(E22900T30SConfig *output)
 
 #ifdef DEBUG
     if (!success)
-        printf("(E22900T30S) Error: Failed to read registry from module!\n");
+        printf("(E22900T30) Error: Failed to read registry from module!\n");
     else
         printf("done\n");
 #endif
@@ -173,13 +173,13 @@ bool E22900T30S::registry(E22900T30SConfig *output)
     return success;
 }
 
-bool E22900T30S::configure(E22900T30SConfig *config)
+bool E22900T30::configure(E22900T30Config *config)
 {
 #ifdef DEBUG
-    printf("(E22900T30S) Writing to registry...");
+    printf("(E22900T30) Writing to registry...");
 #endif
 
-    mode(E22900T30SMode::Mode_Config);
+    mode(E22900T30Mode::Mode_Config);
 
     Byte parameters[12] = {0};
     parameters[0] = 0xC0; // Command
@@ -202,8 +202,8 @@ bool E22900T30S::configure(E22900T30SConfig *config)
 #ifdef DEBUG
     if (!success)
     {
-        printf("(E22900T30S) Error: Writing to Uart\n");
-        mode(E22900T30SMode::Mode_Normal);
+        printf("(E22900T30) Error: Writing to Uart\n");
+        mode(E22900T30Mode::Mode_Normal);
         return false;
     }
 #endif
@@ -217,32 +217,32 @@ bool E22900T30S::configure(E22900T30SConfig *config)
 
 #ifdef DEBUG
     if (!success)
-        printf("(E22900T30S) Error: Module response invalid\n");
+        printf("(E22900T30) Error: Module response invalid\n");
     else
         printf("done\n");
 #endif
 
-    mode(E22900T30SMode::Mode_Normal);
+    mode(E22900T30Mode::Mode_Normal);
     return success;
 }
 
-void E22900T30S::mode(E22900T30SMode mode)
+void E22900T30::mode(E22900T30Mode mode)
 {
-    wait(E22900T30S_TIMEOUT);
+    wait(E22900T30_TIMEOUT);
 
     // Default mode (Normal)
     bool m0 = false;
     bool m1 = false;
 
     // Determine mode values
-    if (mode == E22900T30SMode::Mode_Wakeup)
+    if (mode == E22900T30Mode::Mode_Wakeup)
         m0 = true;
-    else if (mode == E22900T30SMode::Mode_Sleep)
+    else if (mode == E22900T30Mode::Mode_Sleep)
     {
         m0 = true;
         m1 = true;
     }
-    else if (mode == E22900T30SMode::Mode_Config)
+    else if (mode == E22900T30Mode::Mode_Config)
         m1 = true;
 
     if (this->config.mode.expander)
@@ -260,7 +260,7 @@ void E22900T30S::mode(E22900T30SMode mode)
     this->tmode = mode;
 
     // Wait for mode change
-    delay(E22900T30S_WAIT);
+    delay(E22900T30_WAIT);
 
     // Clear any uart buffers
     this->uart->Flush();
@@ -268,13 +268,13 @@ void E22900T30S::mode(E22900T30SMode mode)
     wait(1000);
 }
 
-E22900T30SMode E22900T30S::mode(void)
+E22900T30Mode E22900T30::mode(void)
 {
     return this->tmode;
 }
 
-// Waiting for E22900T30S to finish (AUX = High). Timeout as max waiting time
-void E22900T30S::wait(unsigned int timeout)
+// Waiting for E22900T30 to finish (AUX = High). Timeout as max waiting time
+void E22900T30::wait(unsigned int timeout)
 {
     long int time = millis();
 
@@ -291,7 +291,7 @@ void E22900T30S::wait(unsigned int timeout)
     {
         do
         {
-            delay(E22900T30S_WAIT);
+            delay(E22900T30_WAIT);
 
             if ((millis() - time) > timeout)
                 break;
@@ -302,11 +302,11 @@ void E22900T30S::wait(unsigned int timeout)
     {
         // Kris: if you can't use aux pin, use 4K7 pullup with Arduino
         // you may need to adjust this value if transmissions fail
-        delay(E22900T30S_STATIC_WAIT);
+        delay(E22900T30_STATIC_WAIT);
     }
 }
 
-int E22900T30S::Receive(Byte *buffer, unsigned short size, unsigned int timeout)
+int E22900T30::Receive(Byte *buffer, unsigned short size, unsigned int timeout)
 {
     long int stime = millis();
     int count = -1;
@@ -319,7 +319,7 @@ int E22900T30S::Receive(Byte *buffer, unsigned short size, unsigned int timeout)
         if (this->uart->Available() >= size)
             count = this->uart->Read(buffer, size);
         else
-            delay(E22900T30S_WAIT);
+            delay(E22900T30_WAIT);
 
     } while (count < 0 && (millis() - stime) < timeout);
 
@@ -329,9 +329,9 @@ int E22900T30S::Receive(Byte *buffer, unsigned short size, unsigned int timeout)
     return count;
 }
 
-bool E22900T30S::Send(Byte *buffer, unsigned short length)
+bool E22900T30::Send(Byte *buffer, unsigned short length)
 {
-    if (this->tmode != E22900T30SMode::Mode_Normal)
+    if (this->tmode != E22900T30Mode::Mode_Normal)
         return false;
 
     int written = this->uart->Write(buffer, length);
@@ -339,9 +339,9 @@ bool E22900T30S::Send(Byte *buffer, unsigned short length)
     return written == length;
 }
 
-void E22900T30S::Debug()
+void E22900T30::Debug()
 {
-    printf("E22900T30S Config:\n");
+    printf("E22900T30 Config:\n");
     printf("Address: %d\n", this->config.network.address);
     printf("ID: %d\n", this->config.network.id);
     printf("Air Data Rate: %d\n", this->config.network.airDataRate);
