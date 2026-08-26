@@ -79,7 +79,7 @@ Byte Loop::Rate()
 void Loop::Debug()
 {
     printf("--- Loop ---\n");
-    printf("Target: %lims / %fsec\n", this->target_ms, this->target_sec);
+    printf("Target: %ums / %fsec\n", this->target_ms, this->target_sec);
     printf("Rate: %ifps\n", this->rate);
     printf("------------\n");
 }

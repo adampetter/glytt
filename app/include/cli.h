@@ -1,9 +1,9 @@
 #pragma once
 
 #include <functional>
-#include "api/common/dictionary.h"
-#include "api/common/list.h"
-#include "commands/command.h"
+#include <string>
+
+#include "api/system/cli.h"
 #include "api/system/loop.h"
 
 struct CliConfig{
@@ -14,13 +14,16 @@ class CLI : public Loop
 {
 private:
     CliConfig config;
+    GenericCli cli;
 
 public:
     CLI(const CliConfig& config);
     ~CLI();
 
     void Execute(const FrameTime &time);
+    bool Register(const std::string &name, const std::string &description, CliHandler handler);
+    bool Unregister(const std::string &name);
+    std::string Dispatch(const std::string &input) const;
+    std::string Help() const;
 
-    //void Register(Command* command);
-    //void Unregister(Command* command);
 };

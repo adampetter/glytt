@@ -6,6 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(EXTRA_COMPONENT_DIRS
 	"${CMAKE_SOURCE_DIR}/app"
+	"${CMAKE_SOURCE_DIR}/app_tailer"
 	"${CMAKE_SOURCE_DIR}/api"
 )
 

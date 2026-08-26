@@ -1,4 +1,7 @@
 #include <cstdio>
+#include "cli.h"
+#include "app_tailer.h"
+#include "api/io/i2c.h"
 #include "api/motion/lis3dh.h"
 #include "api/navigation/pa1010d.h"
 #include "api/transmission/e22900t30.h"
@@ -7,6 +10,28 @@
 // Main entry point
 extern "C" void app_main(void)
 {
+    AppTailer tailer(AppTailerConfig{});
+
+    if (!tailer.Start())
+        printf("(App) Failed to start AppTailer\n");
+
+    I2c *gpsI2c = new I2c({.port = I2cPort::I2cPort_0,
+                           .sda = (GpioNum)14,
+                           .scl = (GpioNum)13,
+                           .mode = I2cMode::I2cMode_Master,
+                           .frequency = I2cFrequency::I2cFrequency_01M,
+                           .internalPullup = true});
+
+    Byte i2cDevices = gpsI2c->Scan();
+    printf("(GPS) I2C scan complete, found=%u device(s)\n", i2cDevices);
+
+    PA1010D *gps = new PA1010D({.i2c = gpsI2c,
+                                .address = PA1010D_I2C_DEFAULT_ADDRESS,
+                                .refreshRateSeconds = 1});
+
+    constexpr unsigned int gpsReportIntervalMs = 2000;
+    unsigned int gpsElapsedMs = gpsReportIntervalMs;
+
     /*delay(1000);
 
     I2c *i2c = new I2c({.port = I2cPort::I2cPort_0,
@@ -128,7 +153,44 @@ extern "C" void app_main(void)
     delay(3000);
     printf("Exiting...\n");*/
 
-    Cli cli = new Cli(CliConfig{});
+    CLI cli(CliConfig{});
+    cli.Register("ping", "Health check command", [](const std::string &args) {
+        (void)args;
+        return std::string("pong");
+    });
+
+    cli.Register("tailer:status", "Describe where AppTailer status is reported", [](const std::string &args) {
+        (void)args;
+        return std::string("AppTailer status is printed periodically on monitor logs");
+    });
+
+    std::string startupHelp = cli.Dispatch("help");
+    printf("(CLI) %s\n", startupHelp.c_str());
+
+    while (true)
+    {
+        tailer.Tick();
+
+        if (gpsElapsedMs >= gpsReportIntervalMs)
+        {
+            gpsElapsedMs = 0;
+
+            Location location;
+            gps->Read(&location);
+
+            printf("(GPS) fix=%d sat=%d lat=%.6f lon=%.6f alt=%.2f speed=%.2f course=%.2f\n",
+                   location.fix,
+                   location.satellites,
+                   location.coordinate.X,
+                   location.coordinate.Y,
+                   location.altitude,
+                   location.speed,
+                   location.course);
+        }
+
+        delay(50);
+        gpsElapsedMs += 50;
+    }
 
     // Commands
     // help - list commands
