@@ -48,11 +48,28 @@ E22900T30::E22900T30(const E22900T30Config &config)
     // Start mode
     mode(E22900T30Mode::Mode_Normal);
 
+        if (this->config.startupInNormalModeOnly)
+        {
+        this->ready = true;
+    #if DEBUG
+        printf("(E22900T30) Startup in normal mode only (registry/config bypassed)\n");
+    #endif
+        this->uart->Flush();
+        return;
+        }
+
     E22900T30Config tmp;
     bool result = registry(&tmp);
 
     if (result)
         result = configure(&this->config);
+
+    this->ready = result;
+
+#if DEBUG
+    if (!this->ready)
+        printf("(E22900T30) Init failed; module not ready\n");
+#endif
 
     // Clear uart buffers
     this->uart->Flush();
@@ -335,8 +352,20 @@ bool E22900T30::Send(Byte *buffer, unsigned short length)
         return false;
 
     int written = this->uart->Write(buffer, length);
-    wait(10000); // Max wait is more than the longest possible transmission
+
+    // Without AUX there is no reliable busy signal, so avoid long blocking waits
+    // that stall app state updates (e.g. LED blink cadence during alarm).
+    if (this->config.interupt.aux != GPIO_NONE)
+        wait(10000); // Max wait is more than the longest possible transmission
+    else
+        delay(E22900T30_WAIT);
+
     return written == length;
+}
+
+bool E22900T30::Ready() const
+{
+    return this->ready;
 }
 
 void E22900T30::Debug()

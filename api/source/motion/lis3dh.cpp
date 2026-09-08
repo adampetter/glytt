@@ -17,6 +17,14 @@ Lis3dh::Lis3dh(const Lis3dhConfig *config) : Accelerometer(), Interrupt(config->
     // Config interupt pin if pin number is provided
     if (config->interrupt != GPIO_NONE)
     {
+        // Route high-pass filter to INT1 generator to reduce slow baseline drift/noise.
+        this->i2c->Write(this->config.address, 0x21, 0x01);
+        Byte reference = 0;
+        this->i2c->Read(this->config.address, 0x26, &reference, sizeof(reference));
+
+        // Latch INT1 until INT1_SRC is read, so short pulses are not missed by polling.
+        this->i2c->Write(this->config.address, 0x24, 0x08);
+
         // Set 4D detection is enabled on INT1
         //this->i2c->Write(this->config.address, 0x24, 0x4);
 
@@ -26,8 +34,8 @@ Lis3dh::Lis3dh(const Lis3dhConfig *config) : Accelerometer(), Interrupt(config->
         // Set interupt duration
         this->i2c->Write(this->config.address, 0x33, config->interruptDuration);
 
-        // Set axis to trigger interupt (0xFF = all)
-        this->i2c->Write(this->config.address, 0x30, 0xFF);
+        // INT1_CFG: OR mode, high-event on X/Y/Z only (motion-like changes).
+        this->i2c->Write(this->config.address, 0x30, 0x2A);
 
         // Enable interrupt 1
         this->i2c->Write(this->config.address, 0x22, 0x40);
@@ -82,9 +90,12 @@ bool Lis3dh::Interrupting(bool software)
         return Interrupt::Interrupting();
     else
     {
-        Byte data;
-        this->i2c->Read(this->config.address, 0x31, &data, sizeof(data));
-        return !(data & 0x40);
+        Byte data = 0;
+        if (this->i2c->Read(this->config.address, 0x31, &data, sizeof(data)) != sizeof(data))
+            return false;
+
+        // INT1_SRC bit 6 (IA) is 1 when an interrupt event occurred.
+        return (data & 0x40) != 0;
     }
 }
 

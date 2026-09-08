@@ -14,7 +14,7 @@ class CLI : public Loop
 {
 private:
     CliConfig config;
-    GenericCli cli;
+    Cli cli;
 
 public:
     CLI(const CliConfig& config);

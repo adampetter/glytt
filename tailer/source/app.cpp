@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "cli.h"
-#include "app_tailer.h"
+#include "tailer.h"
+#include "api/io/gpio.h"
 #include "api/io/i2c.h"
 #include "api/motion/lis3dh.h"
 #include "api/navigation/pa1010d.h"
@@ -10,10 +11,31 @@
 // Main entry point
 extern "C" void app_main(void)
 {
-    AppTailer tailer(AppTailerConfig{});
+    TailerConfig tailerConfig;
+    tailerConfig.bluetoothEnabled = false;
+    tailerConfig.baselineCaptureSeconds = 60;
+    tailerConfig.movementSpeedThresholdKph = 2.5f;
+    tailerConfig.movingTemporalWeight = 0.60f;
+    tailerConfig.movingSpatialWeight = 0.40f;
+    tailerConfig.stationaryTemporalWeight = 0.90f;
+    tailerConfig.stationarySpatialWeight = 0.10f;
+    tailerConfig.stationarySensitivityMultiplier = 2.2f;
+    tailerConfig.stationaryModeEngageSeconds = 20;
+    tailerConfig.movingModeEngageSeconds = 10;
+    tailerConfig.dedupWindowMs = 900;
+    tailerConfig.scoreFreshnessSeconds = 12;
+    tailerConfig.persistenceAlertThreshold = 0.58f;
+    tailerConfig.lowEnterScore = 0.42f;
+    tailerConfig.lowExitScore = 0.30f;
+    tailerConfig.mediumEnterScore = 0.72f;
+    tailerConfig.mediumExitScore = 0.55f;
+    tailerConfig.highEnterScore = 0.95f;
+    tailerConfig.highExitScore = 0.85f;
+
+    Tailer tailer(tailerConfig);
 
     if (!tailer.Start())
-        printf("(App) Failed to start AppTailer\n");
+        printf("[APP][ERROR] Failed to start tailer\n");
 
     I2c *gpsI2c = new I2c({.port = I2cPort::I2cPort_0,
                            .sda = (GpioNum)14,
@@ -23,7 +45,7 @@ extern "C" void app_main(void)
                            .internalPullup = true});
 
     Byte i2cDevices = gpsI2c->Scan();
-    printf("(GPS) I2C scan complete, found=%u device(s)\n", i2cDevices);
+    printf("[GPS][INIT] I2C scan complete, found=%u device(s)\n", i2cDevices);
 
     PA1010D *gps = new PA1010D({.i2c = gpsI2c,
                                 .address = PA1010D_I2C_DEFAULT_ADDRESS,
@@ -159,17 +181,180 @@ extern "C" void app_main(void)
         return std::string("pong");
     });
 
-    cli.Register("tailer:status", "Describe where AppTailer status is reported", [](const std::string &args) {
+    cli.Register("tailer:status", "Describe where tailer status is reported", [](const std::string &args) {
         (void)args;
-        return std::string("AppTailer status is printed periodically on monitor logs");
+        return std::string("Tailer status is printed periodically on monitor logs");
     });
 
     std::string startupHelp = cli.Dispatch("help");
-    printf("(CLI) %s\n", startupHelp.c_str());
+    printf("[CLI][HELP] %s\n", startupHelp.c_str());
+
+    const GpioNum greenLedPin = (GpioNum)11;
+    const GpioNum yellowLedPin = (GpioNum)10;
+    const GpioNum redLedPin = (GpioNum)9;
+    const GpioNum buzzerPin = (GpioNum)12;
+    const GpioNum baselineButtonPin = (GpioNum)1;
+
+    Gpio::Mode(greenLedPin, GpioMode::GpioMode_Output);
+    Gpio::Mode(yellowLedPin, GpioMode::GpioMode_Output);
+    Gpio::Mode(redLedPin, GpioMode::GpioMode_Output);
+    Gpio::Mode(buzzerPin, GpioMode::GpioMode_Output);
+    Gpio::Mode(baselineButtonPin, GpioMode::GpioMode_Input);
+    Gpio::Pull(baselineButtonPin, GpioPull::GpioPull_Up);
+
+    Gpio::Write(greenLedPin, true);
+    Gpio::Write(yellowLedPin, false);
+    Gpio::Write(redLedPin, false);
+    Gpio::Write(buzzerPin, false);
+
+    bool previousButtonPressed = false;
+    bool previousBaselineActive = false;
+    long int buttonPressedAtMs = 0;
+    bool longPressHandled = false;
+    bool waitingSecondTap = false;
+    long int firstTapReleasedAtMs = 0;
+    long int lastButtonEdgeMs = 0;
+    bool feedbackGreenOn = false;
+    int feedbackTogglesRemaining = 0;
+    long int feedbackNextToggleMs = 0;
+
+    constexpr long int kLongPressMs = 1400;
+    constexpr long int kDoublePressWindowMs = 1000;
+    constexpr long int kButtonDebounceMs = 60;
+    constexpr long int kFeedbackBlinkIntervalMs = 120;
+
+    printf("[BUTTON][INIT] baseline button on GPIO1 active-low (press=GND)\n");
 
     while (true)
     {
         tailer.Tick();
+
+        bool baselineActive = tailer.BaselineActive();
+        float score = tailer.CurrentScore();
+        TailerAlertLevel alertLevel = tailer.AlertLevel();
+        long int nowMs = millis();
+
+        if (previousBaselineActive && !baselineActive)
+        {
+            // Baseline completed: double green blink.
+            feedbackGreenOn = false;
+            feedbackTogglesRemaining = 4;
+            feedbackNextToggleMs = nowMs;
+        }
+
+        bool buttonPressed = !Gpio::Read(baselineButtonPin);
+
+        if (buttonPressed && !previousButtonPressed && (nowMs - lastButtonEdgeMs) >= kButtonDebounceMs)
+        {
+            lastButtonEdgeMs = nowMs;
+            buttonPressedAtMs = nowMs;
+            longPressHandled = false;
+
+            if (waitingSecondTap && (nowMs - firstTapReleasedAtMs) <= kDoublePressWindowMs)
+            {
+                waitingSecondTap = false;
+                longPressHandled = true;
+                tailer.StartBaseline(tailerConfig.baselineCaptureSeconds);
+                printf("[BUTTON][EVENT] double-press accepted -> baseline\n");
+
+                // Double press accepted: double green blink.
+                feedbackGreenOn = false;
+                feedbackTogglesRemaining = 4;
+                feedbackNextToggleMs = nowMs;
+            }
+            else
+            {
+                printf("[BUTTON][EVENT] pressed\n");
+            }
+        }
+
+        if (buttonPressed && !longPressHandled && (nowMs - buttonPressedAtMs) >= kLongPressMs)
+        {
+            tailer.ClearLearnedBackground();
+            waitingSecondTap = false;
+            longPressHandled = true;
+            printf("[BUTTON][EVENT] long-press accepted -> clear learned baseline\n");
+
+            // Long press accepted: triple green blink.
+            feedbackGreenOn = false;
+            feedbackTogglesRemaining = 6;
+            feedbackNextToggleMs = nowMs;
+        }
+
+        if (!buttonPressed && previousButtonPressed && (nowMs - lastButtonEdgeMs) >= kButtonDebounceMs)
+        {
+            lastButtonEdgeMs = nowMs;
+            printf("[BUTTON][EVENT] released hold=%ldms\n", nowMs - buttonPressedAtMs);
+
+            if (!longPressHandled)
+            {
+                waitingSecondTap = true;
+                firstTapReleasedAtMs = nowMs;
+                printf("[BUTTON][EVENT] first tap registered, waiting second tap\n");
+            }
+        }
+
+        if (waitingSecondTap && (nowMs - firstTapReleasedAtMs) > kDoublePressWindowMs)
+        {
+            waitingSecondTap = false;
+            printf("[BUTTON][EVENT] double-press window expired\n");
+        }
+
+        previousButtonPressed = buttonPressed;
+        previousBaselineActive = baselineActive;
+
+        bool greenOn = false;
+        bool yellowOn = false;
+        bool redOn = false;
+        bool buzzerOn = false;
+
+        if (feedbackTogglesRemaining > 0 && nowMs >= feedbackNextToggleMs)
+        {
+            feedbackGreenOn = !feedbackGreenOn;
+            feedbackTogglesRemaining--;
+            feedbackNextToggleMs = nowMs + kFeedbackBlinkIntervalMs;
+        }
+        else if (feedbackTogglesRemaining == 0)
+        {
+            feedbackGreenOn = false;
+        }
+
+        if (baselineActive)
+        {
+            // Baseline capture indicator: yellow pulse + rare short chirp.
+            yellowOn = ((nowMs / 150) % 2) == 0;
+            buzzerOn = (nowMs % 4000) < 50;
+        }
+        else
+        {
+            switch (alertLevel)
+            {
+            case TailerAlertLevel::Normal:
+                greenOn = true;
+                break;
+            case TailerAlertLevel::Low:
+                yellowOn = ((nowMs / 500) % 2) == 0;
+                break;
+            case TailerAlertLevel::Medium:
+                yellowOn = ((nowMs / 170) % 2) == 0;
+                buzzerOn = (nowMs % 3000) < 90;
+                break;
+            case TailerAlertLevel::High:
+                redOn = ((nowMs / 100) % 2) == 0;
+                buzzerOn = (nowMs % 700) < 140;
+                break;
+            }
+        }
+
+        // During feedback blink sequences, drive green LED directly so the blink
+        // remains visible even when Normal mode would otherwise keep green solid.
+        if (feedbackTogglesRemaining > 0 || feedbackGreenOn)
+            greenOn = feedbackGreenOn;
+
+        Gpio::Write(greenLedPin, greenOn);
+        Gpio::Write(yellowLedPin, yellowOn);
+        Gpio::Write(redLedPin, redOn);
+        Gpio::Write(buzzerPin, buzzerOn);
 
         if (gpsElapsedMs >= gpsReportIntervalMs)
         {
@@ -178,14 +363,19 @@ extern "C" void app_main(void)
             Location location;
             gps->Read(&location);
 
-            printf("(GPS) fix=%d sat=%d lat=%.6f lon=%.6f alt=%.2f speed=%.2f course=%.2f\n",
+                 tailer.UpdateLocation(location);
+
+                    printf("[GPS][STATUS] fix=%d sat=%d lat=%.6f lon=%.6f alt=%.2f speed=%.2f course=%.2f score=%.2f level=%d baseline=%u\n",
                    location.fix,
                    location.satellites,
                    location.coordinate.X,
                    location.coordinate.Y,
                    location.altitude,
                    location.speed,
-                   location.course);
+                         location.course,
+                         score,
+                             (int)alertLevel,
+                             tailer.BaselineSecondsLeft());
         }
 
         delay(50);

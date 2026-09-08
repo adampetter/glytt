@@ -73,6 +73,15 @@ bool WifiIgnoreFilter::IsIgnoredMac(const Byte mac[6]) const
     return std::find(this->macList.begin(), this->macList.end(), value) != this->macList.end();
 }
 
+bool WifiIgnoreFilter::IsIgnoredMac(const char *mac) const
+{
+    std::string value = NormalizeMacString(mac);
+    if (value.empty())
+        return false;
+
+    return std::find(this->macList.begin(), this->macList.end(), value) != this->macList.end();
+}
+
 bool WifiIgnoreFilter::IsIgnoredSsid(const char *ssid) const
 {
     if (ssid == nullptr || ssid[0] == '\0')

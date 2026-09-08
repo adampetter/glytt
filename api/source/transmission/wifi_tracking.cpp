@@ -1,6 +1,28 @@
 #include "api/transmission/wifi_tracking.h"
 
+#include <cmath>
 #include <cstring>
+
+namespace
+{
+    double toRadians(double degrees)
+    {
+        return degrees * (3.14159265358979323846 / 180.0);
+    }
+
+    float haversineMeters(double lat1, double lon1, double lat2, double lon2)
+    {
+        const double dLat = toRadians(lat2 - lat1);
+        const double dLon = toRadians(lon2 - lon1);
+
+        const double a = sin(dLat * 0.5) * sin(dLat * 0.5) +
+                         cos(toRadians(lat1)) * cos(toRadians(lat2)) *
+                             sin(dLon * 0.5) * sin(dLon * 0.5);
+
+        const double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+        return (float)(6371000.0 * c);
+    }
+}
 
 WifiProbeTracker::WifiProbeTracker(const WifiTrackingConfig &config)
 {
@@ -76,6 +98,7 @@ WifiProbeHistory WifiProbeTracker::Analyze(const WifiProbeObservation &current, 
     unsigned long long mediumUs = this->minutesToUs(this->config.mediumMinutes);
     unsigned long long oldUs = this->minutesToUs(this->config.oldMinutes);
     unsigned long long oldestUs = this->minutesToUs(this->config.oldestMinutes);
+    float maxDistanceMeters = 0.0f;
 
     for (size_t i = 0; i < this->observations.size(); i++)
     {
@@ -100,6 +123,13 @@ WifiProbeHistory WifiProbeTracker::Analyze(const WifiProbeObservation &current, 
             history.seenOld = true;
         else
             history.seenOldest = true;
+
+        if (current.hasLocation && entry.hasLocation)
+        {
+            float distance = haversineMeters(current.latitude, current.longitude, entry.latitude, entry.longitude);
+            if (distance > maxDistanceMeters)
+                maxDistanceMeters = distance;
+        }
     }
 
     if (history.seenRecent)
@@ -115,14 +145,74 @@ WifiProbeHistory WifiProbeTracker::Analyze(const WifiProbeObservation &current, 
         history.persistenceScore += 0.25f;
 
     if (history.matchCount >= 8)
-        history.persistenceScore += 0.35f;
+        history.persistenceScore += 0.40f;
     else if (history.matchCount >= 4)
-        history.persistenceScore += 0.25f;
+        history.persistenceScore += 0.30f;
     else if (history.matchCount >= 2)
-        history.persistenceScore += 0.15f;
+        history.persistenceScore += 0.20f;
+    else if (history.matchCount >= 1)
+        history.persistenceScore += 0.20f;
 
     if (history.persistenceScore > 1.0f)
         history.persistenceScore = 1.0f;
+
+    history.maxDistanceMeters = maxDistanceMeters;
+
+    if (maxDistanceMeters >= 100.0f)
+        history.spatialScore = 1.0f;
+    else if (maxDistanceMeters >= 50.0f)
+        history.spatialScore = 0.75f;
+    else if (maxDistanceMeters >= 20.0f)
+        history.spatialScore = 0.50f;
+    else if (maxDistanceMeters >= 5.0f)
+        history.spatialScore = 0.25f;
+    else
+        history.spatialScore = 0.0f;
+
+    if (current.hasLocation)
+    {
+        float temporalWeight = current.temporalWeight;
+        float spatialWeight = current.spatialWeight;
+
+        if (temporalWeight < 0.0f)
+            temporalWeight = 0.0f;
+        if (temporalWeight > 1.0f)
+            temporalWeight = 1.0f;
+
+        if (spatialWeight < 0.0f)
+            spatialWeight = 0.0f;
+        if (spatialWeight > 1.0f)
+            spatialWeight = 1.0f;
+
+        float sum = temporalWeight + spatialWeight;
+        if (sum <= 0.0f)
+        {
+            temporalWeight = 1.0f;
+            spatialWeight = 0.0f;
+        }
+        else
+        {
+            temporalWeight /= sum;
+            spatialWeight /= sum;
+        }
+
+        history.temporalWeight = temporalWeight;
+        history.spatialWeight = spatialWeight;
+        history.movingMode = current.deviceMoving;
+
+        history.combinedScore = history.persistenceScore * history.temporalWeight +
+                                history.spatialScore * history.spatialWeight;
+    }
+    else
+    {
+        history.temporalWeight = 1.0f;
+        history.spatialWeight = 0.0f;
+        history.movingMode = false;
+        history.combinedScore = history.persistenceScore;
+    }
+
+    if (history.combinedScore > 1.0f)
+        history.combinedScore = 1.0f;
 
     return history;
 }

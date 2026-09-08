@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-void GenericCli::splitInput(const std::string &input, std::string *command, std::string *args)
+void Cli::splitInput(const std::string &input, std::string *command, std::string *args)
 {
     if (command == nullptr || args == nullptr)
         return;
@@ -28,7 +28,7 @@ void GenericCli::splitInput(const std::string &input, std::string *command, std:
         *args = input.substr(argsStart);
 }
 
-bool GenericCli::Register(const std::string &name, const std::string &description, CliHandler handler)
+bool Cli::Register(const std::string &name, const std::string &description, CliHandler handler)
 {
     if (name.empty() || !handler)
         return false;
@@ -40,22 +40,22 @@ bool GenericCli::Register(const std::string &name, const std::string &descriptio
     return true;
 }
 
-bool GenericCli::Unregister(const std::string &name)
+bool Cli::Unregister(const std::string &name)
 {
     return this->commands.erase(name) > 0;
 }
 
-bool GenericCli::Contains(const std::string &name) const
+bool Cli::Contains(const std::string &name) const
 {
     return this->commands.find(name) != this->commands.end();
 }
 
-void GenericCli::Clear()
+void Cli::Clear()
 {
     this->commands.clear();
 }
 
-std::string GenericCli::Dispatch(const std::string &input) const
+std::string Cli::Dispatch(const std::string &input) const
 {
     std::string command;
     std::string args;
@@ -71,7 +71,7 @@ std::string GenericCli::Dispatch(const std::string &input) const
     return it->second.handler(args);
 }
 
-std::vector<CliCommandInfo> GenericCli::List() const
+std::vector<CliCommandInfo> Cli::List() const
 {
     std::vector<CliCommandInfo> items;
     items.reserve(this->commands.size());

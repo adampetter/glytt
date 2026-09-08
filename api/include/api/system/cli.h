@@ -13,7 +13,7 @@ struct CliCommandInfo
     std::string description;
 };
 
-class GenericCli
+class Cli
 {
 private:
     struct RegisteredCommand
@@ -27,7 +27,7 @@ private:
     static void splitInput(const std::string &input, std::string *command, std::string *args);
 
 public:
-    GenericCli() = default;
+    Cli() = default;
 
     bool Register(const std::string &name, const std::string &description, CliHandler handler);
     bool Unregister(const std::string &name);

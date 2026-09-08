@@ -17,6 +17,7 @@ public:
     void AddSsid(const char *ssid);
 
     bool IsIgnoredMac(const Byte mac[6]) const;
+    bool IsIgnoredMac(const char *mac) const;
     bool IsIgnoredSsid(const char *ssid) const;
 
     void Clear();

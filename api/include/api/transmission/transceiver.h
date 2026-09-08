@@ -8,7 +8,7 @@ public:
     Transceiver() {
 
     };
-    ~Transceiver() {
+    virtual ~Transceiver() {
 
     };
 

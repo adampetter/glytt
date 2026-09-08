@@ -117,6 +117,8 @@ enum E22900T30WakeOnRadioInterval
 
 struct E22900T30Config
 {
+    bool startupInNormalModeOnly = false;
+
     struct Serial
     {
         Uart *uart = NULL;
@@ -170,6 +172,7 @@ class E22900T30 : public Transceiver
 {
 private:
     E22900T30Config config;
+    bool ready = false;
 
 protected:
     Uart *uart = NULL;
@@ -188,5 +191,6 @@ public:
 
     int Receive(Byte *buffer, unsigned short length, unsigned int timeout);
     bool Send(Byte *buffer, unsigned short length = 1);
+    bool Ready() const;
     void Debug();
 };

@@ -9,6 +9,13 @@ struct WifiProbeObservation
     char mac[18] = {0};
     char ssid[33] = {0};
     unsigned long long timestampUs = 0;
+    bool hasLocation = false;
+    double latitude = 0.0;
+    double longitude = 0.0;
+    float speedKph = 0.0f;
+    bool deviceMoving = false;
+    float temporalWeight = 1.0f;
+    float spatialWeight = 0.0f;
 };
 
 struct WifiTrackingConfig
@@ -29,6 +36,12 @@ struct WifiProbeHistory
 
     unsigned int matchCount = 0;
     float persistenceScore = 0.0f;
+    float spatialScore = 0.0f;
+    float combinedScore = 0.0f;
+    float maxDistanceMeters = 0.0f;
+    float temporalWeight = 1.0f;
+    float spatialWeight = 0.0f;
+    bool movingMode = false;
 };
 
 class WifiProbeTracker
