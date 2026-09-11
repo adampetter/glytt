@@ -6,6 +6,7 @@ list(APPEND SOURCES
     source/io/buzzer.cpp
     source/io/led.cpp
     source/system/cli.cpp
+    source/system/sleep.cpp
     source/transmission/bluetooth.cpp
     source/transmission/mock_transceiver.cpp
     source/transmission/wifi_frame.cpp

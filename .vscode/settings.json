@@ -10,5 +10,6 @@
     "IDF_CCACHE_ENABLE": "1",
     "ESP_ROM_ELF_DIR": "C:\\Users\\Alex\\.espressif\\tools\\esp-rom-elfs\\20230320/",
     "IDF_TARGET": "esp32s3"
-  }
+  },
+  "idf.flashType": "UART"
 }

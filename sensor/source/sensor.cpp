@@ -1,388 +1,271 @@
 #include "sensor.h"
-
+#include "config.h"
 #include "api/common/time.h"
-#include "api/transmission/package.h"
-
-#include "esp_sleep.h"
 
 #include <cstdio>
-#include <cstring>
+
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
 
 Sensor::Sensor(const SensorConfig &config)
+    : Loop(config.rate), config(config), sleep(config.sleep)
 {
-    this->config = config;
-
-    if (this->config.radio.packetLength > TRANSCEIVER_PACKAGE_SIZE)
-        this->config.radio.packetLength = TRANSCEIVER_PACKAGE_SIZE;
-
-    if (this->config.radio.packetLength <= Package::HeaderSize)
-        this->config.radio.packetLength = 64;
-
-    if (this->config.radio.heartbeatIntervalMs == 0)
-        this->config.radio.heartbeatIntervalMs = 15000;
-
-    if (this->config.power.monitorSleepMs == 0)
-        this->config.power.monitorSleepMs = 250;
-
-    if (this->config.motion.requiredEvents == 0)
-        this->config.motion.requiredEvents = 1;
 }
 
 bool Sensor::Start()
 {
-    if (this->config.radio.transceiver == nullptr || this->config.sensors.accelerometer == nullptr)
+    this->state = SensorState::Running;
+    this->startedAtMs = millis();
+    this->lastTelemetryAtMs = this->startedAtMs;
+    this->lastDetectionAtMs = this->startedAtMs;
+    this->warnedMissingAccelerometer = false;
+    this->lastAcceleration = Acceleration::Empty;
+    this->sampleCount = 0;
+    this->lastInterrupt = false;
+    this->interruptCount = 0;
+    this->irqEventHead = 0;
+    this->irqEventCount = 0;
+    this->detectionWindowIrqDelta = 0;
+    this->detectionWindowLatched = false;
+    this->redPulseUntilAtMs = 0;
+    this->greenWakePulseUntilAtMs = 0;
+
+    if (this->config.ledGreen != GPIO_NONE)
+    {
+        this->greenLed.Begin(this->config.ledGreen, this->config.ledActiveLow);
+        this->greenLed.SetOff();
+    }
+
+    if (this->config.ledRed != GPIO_NONE)
+    {
+        this->redLed.Begin(this->config.ledRed, this->config.ledActiveLow);
+        this->redLed.SetOff();
+    }
+
+#ifdef BUZZER
+    if (this->config.buzzer != GPIO_NONE)
+    {
+        this->buzzer.Begin(this->config.buzzer, this->config.buzzerActiveLow);
+        this->buzzer.SetEnabled(true);
+        this->buzzer.SetOff();
+        this->buzzer.Update(this->startedAtMs);
+    }
+#endif
+
+    if (this->config.noDetectionSleepMs == 0)
+        this->config.noDetectionSleepMs = 10000;
+
+    if (this->config.detectionWindowMs == 0)
+        this->config.detectionWindowMs = 2000;
+
+    if (this->config.detectionIrqThreshold == 0)
+        this->config.detectionIrqThreshold = 3;
+
+    if (this->config.detectionPulseMs == 0)
+        this->config.detectionPulseMs = 500;
+
+    if (!this->sleep.Ready())
+    {
+        this->state = SensorState::Fault;
+        printf("[SENSOR][ERROR] invalid sleep wake pin: %d\n", this->config.sleep.wakePin);
         return false;
+    }
 
-    this->greenLed.Begin(this->config.pins.ledGreen, this->config.indicators.ledActiveLow);
-    this->redLed.Begin(this->config.pins.ledRed, this->config.indicators.ledActiveLow);
-    this->buzzer.Begin(this->config.pins.buzzer, false);
-    this->buzzer.SetEnabled(this->config.indicators.buzzerEnabled);
+    printf("[SENSOR] started target=%ums\n", this->Target());
 
-    this->gpsAvailable = this->config.sensors.gps != nullptr;
-    this->lastLocation = Location{};
-    this->previousAcceleration = Acceleration::Empty;
+    if (this->config.sleep.enabled)
+    {
+         printf("[SENSOR][SLEEP] wakePin=%d wakeLevel=%s noDetectionSleepMs=%ums wakeCause=%d\n",
+               this->config.sleep.wakePin,
+               this->config.sleep.wakeOnLow ? "low" : "high",
+             this->config.noDetectionSleepMs,
+                             (int)this->sleep.WakeupCause());
+    }
 
-    this->state = SensorState::ProbePeripherals;
-    this->stats = SensorStats{};
-    this->sequence = 0;
-    this->motionEventsInWindow = 0;
-    this->lastStatusAtMs = millis();
-    this->startedAtMs = this->lastStatusAtMs;
-    this->warningStartedAtMs = 0;
-    this->warningBlinkUntilAtMs = 0;
-    this->lastAlarmAtMs = 0;
-    this->alarmStartedAtMs = 0;
-    this->cooldownStartedAtMs = 0;
-    this->firstMotionEventAtMs = 0;
-    this->lastAmplitudeOnlyHitAtMs = 0;
-    this->amplitudeOnlyHits = 0;
-    this->lastMotionDeltaSquared = 0;
-    this->warningConfidenceScore = 0;
-    this->warningConfirmedEvents = 0;
-    this->warningInterruptEvents = 0;
-    this->warningStrongIrqEvents = 0;
-    this->warningPeakDeltaSquared = 0;
-    this->preWarningIrqHits = 0;
-    this->preWarningFirstAtMs = 0;
-    this->lastTelemetryAtMs = 0;
-    this->warningHasInterruptEvidence = false;
-    this->lastMotionEventHadInterrupt = false;
+        printf("[SENSOR][DETECT] threshold=%u windowMs=%u pulseMs=%u\n",
+            this->config.detectionIrqThreshold,
+            this->config.detectionWindowMs,
+            this->config.detectionPulseMs);
 
-    // Prime acceleration baseline so the first delta does not spike on startup.
-    this->config.sensors.accelerometer->Read(&this->previousAcceleration);
-    this->config.sensors.accelerometer->Interrupting(true);
-
-    printf("[SENSOR][INIT] started packet=%u airRate=%u deepSleep=%s buzzer=%s gps=%s id=%u\n",
-           this->config.radio.packetLength,
-           (unsigned int)this->config.radio.airDataRate,
-           this->config.power.deepSleepPreferred ? "on" : "off",
-           this->config.indicators.buzzerEnabled ? "on" : "off",
-           this->gpsAvailable ? "on" : "off",
-           this->config.privacy.pseudonymousDeviceId);
-    printf("[SENSOR][LED] green=monitor (blink), red=alarm (blink) / fault (solid)\n");
-
-    this->state = SensorState::ArmAndSleep;
-    this->updateOutputs(millis());
     return true;
 }
 
-void Sensor::Tick()
+void Sensor::Execute(const FrameTime &time)
 {
-    const unsigned short preWarningRequiredIrqHits = 2;
-    const unsigned int preWarningWindowMs = 2600;
-    const unsigned int preWarningMinGapMs = 80;
-    const unsigned short alarmRequiredIrqEvents = 2;
-    const unsigned short alarmRequiredStrongIrqEvents = 2;
+    (void)time;
+
+    if (this->state != SensorState::Running)
+        return;
+
+    if (this->pendingWakeLog)
+    {
+        this->pendingWakeLog = false;
+        if (this->pendingWakeFromConfiguredSource)
+        {
+            printf("[SENSOR][SLEEP] wake detected from configured source, detection timer reset\n");
+                esp_rom_printf("[SENSOR][SLEEP][ROM] wake configured source\n");
+        }
+        else
+        {
+            printf("[SENSOR][SLEEP] wake detected from other source (cause=%d), detection timer reset\n",
+                   (int)this->pendingWakeCause);
+                esp_rom_printf("[SENSOR][SLEEP][ROM] wake other source cause=%d\n", (int)this->pendingWakeCause);
+        }
+            fflush(stdout);
+    }
 
     unsigned long nowMs = millis();
 
-    this->pollIncomingFrames();
-
-    if (this->preWarningFirstAtMs != 0 && (nowMs - this->preWarningFirstAtMs) > preWarningWindowMs)
+    if (this->config.accelerometer != nullptr)
     {
-        this->preWarningIrqHits = 0;
-        this->preWarningFirstAtMs = 0;
-    }
-
-    if (this->warningStartedAtMs != 0 && (nowMs - this->warningStartedAtMs) > this->config.alarm.warningWindowMs)
-    {
-        this->warningStartedAtMs = 0;
-        this->warningConfidenceScore = 0;
-        this->warningConfirmedEvents = 0;
-        this->warningInterruptEvents = 0;
-        this->warningStrongIrqEvents = 0;
-        this->warningPeakDeltaSquared = 0;
-        this->warningHasInterruptEvidence = false;
-    }
-
-    // If warning evidence is already strong enough, do not require another
-    // post-delay impact event just to transition into alarm.
-    if (this->state != SensorState::AlarmActive &&
-        this->state != SensorState::AlarmCooldown &&
-        this->warningStartedAtMs != 0)
-    {
-        bool warningDelayPassed = (nowMs - this->warningStartedAtMs) >= this->config.alarm.minSecondDetectionDelayMs;
-        bool confidencePassed = this->warningConfidenceScore >= 3 && this->warningConfirmedEvents >= 2;
-        bool secureEvidencePassed = this->warningHasInterruptEvidence &&
-                                  this->warningInterruptEvents >= alarmRequiredIrqEvents &&
-                                  this->warningStrongIrqEvents >= alarmRequiredStrongIrqEvents;
-
-        if (warningDelayPassed && confidencePassed && secureEvidencePassed)
+        this->lastInterrupt = this->config.accelerometer->Interrupting(true);
+        if (this->lastInterrupt)
         {
-            this->state = SensorState::AlarmActive;
-            this->alarmStartedAtMs = nowMs;
-            this->lastAlarmAtMs = 0;
-            this->warningStartedAtMs = 0;
-            this->warningBlinkUntilAtMs = 0;
-            this->warningConfidenceScore = 0;
-            this->warningConfirmedEvents = 0;
-            this->warningInterruptEvents = 0;
-            this->warningStrongIrqEvents = 0;
-            this->warningPeakDeltaSquared = 0;
-            this->warningHasInterruptEvidence = false;
-            printf("[SENSOR][ALARM] delayed promotion from warning evidence (irqEvents>=%u strongIrq>=%u)\n",
-                   (unsigned int)alarmRequiredIrqEvents,
-                   (unsigned int)alarmRequiredStrongIrqEvents);
+            this->interruptCount++;
+
+            if (this->irqEventCount < Sensor::MaxIrqEventsInWindow)
+            {
+                unsigned int writeIndex = (this->irqEventHead + this->irqEventCount) % Sensor::MaxIrqEventsInWindow;
+                this->irqEventTimesMs[writeIndex] = nowMs;
+                this->irqEventCount++;
+            }
+            else
+            {
+                this->irqEventTimesMs[this->irqEventHead] = nowMs;
+                this->irqEventHead = (this->irqEventHead + 1) % Sensor::MaxIrqEventsInWindow;
+            }
         }
-    }
 
-    if (this->state == SensorState::WarningActive)
-    {
-        if (nowMs >= this->warningBlinkUntilAtMs)
-            this->state = SensorState::ArmAndSleep;
-    }
-
-    if (this->state == SensorState::ArmAndSleep)
-    {
-        this->updateOutputs(nowMs);
-        this->applySleepInMonitor();
-        this->stats.wakeEvents++;
-        this->state = SensorState::WakeValidateMotion;
-    }
-
-    if (this->state == SensorState::WakeValidateMotion)
-    {
-        if (this->detectMotionEvent())
+        while (this->irqEventCount > 0)
         {
-            if (this->motionEventsInWindow == 0 || (nowMs - this->firstMotionEventAtMs) > this->config.motion.eventWindowMs)
+            unsigned long oldestAtMs = this->irqEventTimesMs[this->irqEventHead];
+            if ((nowMs - oldestAtMs) <= this->config.detectionWindowMs)
+                break;
+
+            this->irqEventHead = (this->irqEventHead + 1) % Sensor::MaxIrqEventsInWindow;
+            this->irqEventCount--;
+        }
+
+        this->detectionWindowIrqDelta = this->irqEventCount;
+
+        if (this->detectionWindowIrqDelta >= this->config.detectionIrqThreshold)
+        {
+            if (!this->detectionWindowLatched)
             {
-                this->firstMotionEventAtMs = nowMs;
-                this->motionEventsInWindow = 1;
-            }
-            else
-                this->motionEventsInWindow++;
+                this->detectionWindowLatched = true;
+                this->lastDetectionAtMs = nowMs;
 
-            if (this->motionEventsInWindow >= this->config.motion.requiredEvents)
-            {
-                this->stats.wakeConfirmed++;
-                bool hasWarningWindow = this->warningStartedAtMs != 0 && (nowMs - this->warningStartedAtMs) <= this->config.alarm.warningWindowMs;
-                bool warningDelayPassed = this->warningStartedAtMs != 0 &&
-                                          (nowMs - this->warningStartedAtMs) >= this->config.alarm.minSecondDetectionDelayMs;
-
-                if (hasWarningWindow)
+                if (this->config.ledRed != GPIO_NONE)
                 {
-                    this->preWarningIrqHits = 0;
-                    this->preWarningFirstAtMs = 0;
-
-                    if (this->lastMotionDeltaSquared > this->warningPeakDeltaSquared)
-                        this->warningPeakDeltaSquared = this->lastMotionDeltaSquared;
-
-                    unsigned int strongIrqThreshold = (this->config.motion.minDeltaSquared * 22U) / 10U;
-                    if (strongIrqThreshold < 650U)
-                        strongIrqThreshold = 650U;
-
-                    if (this->lastMotionEventHadInterrupt)
-                    {
-                        this->warningHasInterruptEvidence = true;
-                        if (this->warningInterruptEvents < 65535)
-                            this->warningInterruptEvents++;
-
-                        if (this->lastMotionDeltaSquared >= strongIrqThreshold && this->warningStrongIrqEvents < 65535)
-                            this->warningStrongIrqEvents++;
-                    }
-
-                    unsigned short scoreAdd = this->lastMotionEventHadInterrupt ? 2 : 1;
-                    unsigned int nextScore = (unsigned int)this->warningConfidenceScore + (unsigned int)scoreAdd;
-                    this->warningConfidenceScore = (unsigned short)(nextScore > 65535U ? 65535U : nextScore);
-
-                    if (this->warningConfirmedEvents < 65535)
-                        this->warningConfirmedEvents++;
-
-                    bool confidencePassed = this->warningConfidenceScore >= 3 && this->warningConfirmedEvents >= 2;
-                    bool secureEvidencePassed = this->warningHasInterruptEvidence &&
-                                              this->warningInterruptEvents >= alarmRequiredIrqEvents &&
-                                              this->warningStrongIrqEvents >= alarmRequiredStrongIrqEvents;
-                    if (warningDelayPassed && confidencePassed && secureEvidencePassed)
-                    {
-                        this->state = SensorState::AlarmActive;
-                        this->alarmStartedAtMs = nowMs;
-                        this->lastAlarmAtMs = 0;
-                        this->warningStartedAtMs = 0;
-                        this->warningBlinkUntilAtMs = 0;
-                        this->warningConfidenceScore = 0;
-                        this->warningConfirmedEvents = 0;
-                        this->warningInterruptEvents = 0;
-                        this->warningStrongIrqEvents = 0;
-                        this->warningPeakDeltaSquared = 0;
-                        this->warningHasInterruptEvidence = false;
-                           printf("[SENSOR][ALARM] confidence gate passed in warning window (irqEvents>=%u strongIrq>=%u)\n",
-                               (unsigned int)alarmRequiredIrqEvents,
-                               (unsigned int)alarmRequiredStrongIrqEvents);
-                    }
-                    else
-                    {
-                        this->state = SensorState::ArmAndSleep;
-                        printf("[SENSOR][WARN] holding: delay=%u/%u score=%u events=%u irq=%u irqSeen=%u irqEvents=%u strongIrq=%u peakD2=%u\n",
-                               (unsigned int)(nowMs - this->warningStartedAtMs),
-                               this->config.alarm.minSecondDetectionDelayMs,
-                               this->warningConfidenceScore,
-                               this->warningConfirmedEvents,
-                               this->lastMotionEventHadInterrupt ? 1U : 0U,
-                               this->warningHasInterruptEvidence ? 1U : 0U,
-                               this->warningInterruptEvents,
-                               this->warningStrongIrqEvents,
-                               this->warningPeakDeltaSquared);
-                    }
-                }
-                else
-                {
-                    unsigned int strongIrqThreshold = (this->config.motion.minDeltaSquared * 22U) / 10U;
-                    if (strongIrqThreshold < 650U)
-                        strongIrqThreshold = 650U;
-
-                    bool isStrongIrq = this->lastMotionEventHadInterrupt && this->lastMotionDeltaSquared >= strongIrqThreshold;
-                    if (isStrongIrq)
-                    {
-                        if (this->preWarningFirstAtMs == 0 || (nowMs - this->preWarningFirstAtMs) > preWarningWindowMs)
-                        {
-                            this->preWarningFirstAtMs = nowMs;
-                            this->preWarningIrqHits = 1;
-                        }
-                        else if (this->preWarningIrqHits == 1 && (nowMs - this->preWarningFirstAtMs) < preWarningMinGapMs)
-                        {
-                            // Too close to the first hit, likely same vibration burst.
-                            this->preWarningIrqHits = 1;
-                        }
-                        else if (this->preWarningIrqHits < 65535)
-                            this->preWarningIrqHits++;
-                    }
-                    else
-                    {
-                        this->preWarningIrqHits = 0;
-                        this->preWarningFirstAtMs = 0;
-                    }
-
-                    if (this->preWarningIrqHits < preWarningRequiredIrqHits)
-                    {
-                        this->state = SensorState::ArmAndSleep;
-                        printf("[SENSOR][PREWARN] candidate %u/%u d2=%u strong=%u irq=%u\n",
-                               this->preWarningIrqHits,
-                               (unsigned int)preWarningRequiredIrqHits,
-                               this->lastMotionDeltaSquared,
-                               isStrongIrq ? 1U : 0U,
-                               this->lastMotionEventHadInterrupt ? 1U : 0U);
-
-                        this->motionEventsInWindow = 0;
-                        this->updateOutputs(nowMs);
-                        return;
-                    }
-
-                    this->state = SensorState::WarningActive;
-                    this->warningStartedAtMs = nowMs;
-                    this->warningBlinkUntilAtMs = nowMs + 350;
-                    this->warningConfidenceScore = this->lastMotionEventHadInterrupt ? 2 : 1;
-                    this->warningConfirmedEvents = 1;
-                    this->warningPeakDeltaSquared = this->lastMotionDeltaSquared;
-
-                    this->warningInterruptEvents = this->lastMotionEventHadInterrupt ? 1 : 0;
-                    this->warningStrongIrqEvents = (this->lastMotionEventHadInterrupt && this->lastMotionDeltaSquared >= strongIrqThreshold) ? 1 : 0;
-                    this->warningHasInterruptEvidence = this->lastMotionEventHadInterrupt;
-                    this->preWarningIrqHits = 0;
-                    this->preWarningFirstAtMs = 0;
-
-                    if (this->sendWarningFrame(nowMs))
-                        this->stats.warningTx++;
-                    else
-                        this->stats.warningTxErrors++;
-
-                    printf("[SENSOR][WARN] first detection -> warning sent, waiting 10s for second detection\n");
+                    this->redLed.SetSolidOn();
+                    this->redPulseUntilAtMs = nowMs + this->config.detectionPulseMs;
                 }
 
-                this->motionEventsInWindow = 0;
-                this->updateOutputs(nowMs);
+#if BUZZER
+                this->buzzer.SetSolidOn();
+                this->buzzer.Update(nowMs);
+#endif
+
+                printf("[SENSOR][DETECT] detection confirmed (irqDelta=%u/%u in %ums)\n",
+                       this->detectionWindowIrqDelta,
+                       this->config.detectionIrqThreshold,
+                       this->config.detectionWindowMs);
             }
-            else
-                this->state = SensorState::ArmAndSleep;
         }
         else
         {
-            this->stats.wakeRejected++;
-            this->state = SensorState::ArmAndSleep;
+            this->detectionWindowLatched = false;
         }
+
+        this->config.accelerometer->Read(&this->lastAcceleration);
+        this->sampleCount++;
+    }
+    else if (!this->warnedMissingAccelerometer)
+    {
+        this->warnedMissingAccelerometer = true;
+        printf("[SENSOR][WARN] no accelerometer configured\n");
     }
 
-    if (this->state == SensorState::AlarmActive)
+    if (this->config.ledRed != GPIO_NONE && this->redPulseUntilAtMs != 0 && nowMs >= this->redPulseUntilAtMs)
     {
-        if (this->lastAlarmAtMs == 0 || (nowMs - this->lastAlarmAtMs) >= this->config.alarm.intervalMs)
-        {
-            this->lastAlarmAtMs = nowMs;
-            if (this->sendAlarmFrame(nowMs))
-                this->stats.alarmTx++;
-            else
-                this->stats.alarmTxErrors++;
-        }
+        this->redPulseUntilAtMs = 0;
+        this->redLed.SetOff();
 
-        if ((nowMs - this->alarmStartedAtMs) >= this->config.alarm.timeoutMs)
-        {
-            this->state = SensorState::AlarmCooldown;
-            this->cooldownStartedAtMs = nowMs;
-            this->warningStartedAtMs = 0;
-            this->warningBlinkUntilAtMs = 0;
-            this->warningConfidenceScore = 0;
-            this->warningConfirmedEvents = 0;
-            this->warningInterruptEvents = 0;
-            this->warningStrongIrqEvents = 0;
-            this->warningPeakDeltaSquared = 0;
-            this->warningHasInterruptEvidence = false;
-            this->updateOutputs(nowMs);
-            printf("[SENSOR][ALARM] timeout reached, cooldown\n");
-        }
+#if BUZZER
+        this->buzzer.SetOff();
+    this->buzzer.Update(nowMs);
+#endif
     }
 
-    if (this->state == SensorState::AlarmCooldown)
+    if (this->config.ledGreen != GPIO_NONE &&
+        this->greenWakePulseUntilAtMs != 0 &&
+        nowMs >= this->greenWakePulseUntilAtMs)
     {
-        if ((nowMs - this->cooldownStartedAtMs) >= this->config.alarm.cooldownMs)
-        {
-            this->state = SensorState::ArmAndSleep;
-            this->updateOutputs(nowMs);
-        }
+        this->greenWakePulseUntilAtMs = 0;
+        this->greenLed.SetOff();
     }
 
-    if ((nowMs - this->lastStatusAtMs) >= this->config.radio.heartbeatIntervalMs)
+#if BUZZER
+    this->buzzer.Update(nowMs);
+#endif
+
+    if (this->config.sleep.enabled && (nowMs - this->lastDetectionAtMs) >= this->config.noDetectionSleepMs)
     {
-        this->lastStatusAtMs = nowMs;
-        if (!this->sendStatusFrame(nowMs))
-            this->stats.statusTxErrors++;
+        printf("[SENSOR][SLEEP] no detection for %ums, entering sleep\n", this->config.noDetectionSleepMs);
+        esp_rom_printf("[SENSOR][SLEEP][ROM] entering sleep\n");
+        fflush(stdout);
+        this->Sleep();
+        fflush(stdout);
+        return;
+    }
+
+    bool shouldPrintTelemetry = this->config.printTelemetry &&
+                                (this->config.telemetryIntervalMs == 0 ||
+                                 (nowMs - this->lastTelemetryAtMs) >= this->config.telemetryIntervalMs);
+
+    if (shouldPrintTelemetry)
+    {
+        this->lastTelemetryAtMs = nowMs;
+
+        if (this->config.accelerometer != nullptr)
+        {
+                         printf("[SENSOR] uptime=%lums samples=%lu irq=%d irqCount=%lu winDelta=%u acc(x=%d y=%d z=%d |len|=%.2f)\n",
+                   nowMs - this->startedAtMs,
+                   this->sampleCount,
+                 this->lastInterrupt ? 1 : 0,
+                 this->interruptCount,
+                 this->detectionWindowIrqDelta,
+                   this->lastAcceleration.X,
+                   this->lastAcceleration.Y,
+                   this->lastAcceleration.Z,
+                   this->lastAcceleration.Length());
+        }
         else
-            this->stats.statusTx++;
-
-         printf("[SENSOR][STAT] state=%s statusTx=%u statusErr=%u warnTx=%u warnErr=%u alarmTx=%u alarmErr=%u\n",
-               stateName(this->state),
-               this->stats.statusTx,
-               this->stats.statusTxErrors,
-             this->stats.warningTx,
-             this->stats.warningTxErrors,
-               this->stats.alarmTx,
-               this->stats.alarmTxErrors);
+        {
+                        printf("[SENSOR] uptime=%lums samples=%lu acc=unavailable\n",
+                   nowMs - this->startedAtMs,
+                   this->sampleCount);
+        }
     }
-
-    this->updateOutputs(nowMs);
 }
 
 void Sensor::Stop()
 {
-    this->state = SensorState::Boot;
-    this->updateOutputs(millis());
+    this->state = SensorState::Stopped;
+    this->Terminate();
+
+#if BUZZER
+    this->buzzer.SetOff();
+    this->buzzer.Update(millis());
+#endif
+
+    if (this->config.ledGreen != GPIO_NONE)
+        this->greenLed.SetOff();
+
+    if (this->config.ledRed != GPIO_NONE)
+        this->redLed.SetOff();
+
+    printf("[SENSOR] stopped\n");
 }
 
 SensorState Sensor::State() const
@@ -390,468 +273,111 @@ SensorState Sensor::State() const
     return this->state;
 }
 
-SensorStats Sensor::Stats() const
+void Sensor::Sleep()
 {
-    return this->stats;
-}
-
-bool Sensor::BuzzerEnabled() const
-{
-    return this->buzzer.Enabled();
-}
-
-void Sensor::SetBuzzerEnabled(bool enabled)
-{
-    this->config.indicators.buzzerEnabled = enabled;
-    this->buzzer.SetEnabled(enabled);
+#if BUZZER
+    this->buzzer.SetOff();
     this->buzzer.Update(millis());
-}
+#endif
 
-void Sensor::ToggleBuzzer()
-{
-    this->SetBuzzerEnabled(!this->buzzer.Enabled());
-}
-
-void Sensor::updateOutputs(unsigned long nowMs)
-{
-    unsigned int greenIntervalMs = this->config.indicators.greenBlinkIntervalMs;
-    if (greenIntervalMs == 0)
-        greenIntervalMs = 1200;
-
-    unsigned int greenOnMs = this->config.indicators.greenBlinkOnMs;
-    if (greenOnMs == 0 || greenOnMs > greenIntervalMs)
-        greenOnMs = greenIntervalMs / 2;
-
-    unsigned int redBlinkIntervalMs = this->config.indicators.redAlarmBlinkIntervalMs;
-    if (redBlinkIntervalMs == 0)
-        redBlinkIntervalMs = 400;
-
-    unsigned int redOnMs = redBlinkIntervalMs / 2;
-    if (redOnMs == 0)
-        redOnMs = 1;
-
-    if (this->state == SensorState::AlarmActive)
+    if (this->config.accelerometer != nullptr)
     {
-        this->greenLed.SetOff();
-        this->redLed.SetBlink(redBlinkIntervalMs, redOnMs, nowMs);
-        this->buzzer.SetBlink(redBlinkIntervalMs, redOnMs, nowMs);
+        (void)this->config.accelerometer->Interrupting(true);
     }
-    else if (this->state == SensorState::WarningActive)
+
+    gpio_num_t wakePin = (gpio_num_t)this->config.sleep.wakePin;
+    int activeLevel = this->config.sleep.wakeOnLow ? 0 : 1;
+    int level = gpio_get_level(wakePin);
+    if (level == activeLevel)
     {
-        this->greenLed.SetOff();
-        this->redLed.SetBlink(300, 150, nowMs);
-        this->buzzer.SetBlink(300, 150, nowMs);
+        this->lastDetectionAtMs = millis();
+        printf("[SENSOR][SLEEP] wake pin already active on GPIO%d, delaying sleep\n", this->config.sleep.wakePin);
+        fflush(stdout);
+        return;
     }
-    else if (this->state == SensorState::Fault)
-    {
+
+    if (this->config.ledGreen != GPIO_NONE)
         this->greenLed.SetOff();
-        this->redLed.SetSolidOn();
-        this->buzzer.SetOff();
-    }
-    else
+
+    printf("[SENSOR][SLEEP] sleeping on GPIO%d %s\n",
+           this->config.sleep.wakePin,
+           this->config.sleep.wakeOnLow ? "LOW" : "HIGH");
+    fflush(stdout);
+
+    bool enteredSleep = false;
+    esp_err_t sleepResult = ESP_ERR_NOT_SUPPORTED;
+
+#if DEBUG
+    printf("[SENSOR][SLEEP] developer bypass active, skipping Sleep::Begin\n");
+    esp_rom_printf("[SENSOR][SLEEP][ROM] developer bypass active\n");
+#else
+    enteredSleep = this->sleep.Begin();
+    sleepResult = this->sleep.LastResult();
+#endif
+
+    if (!enteredSleep)
     {
-        this->greenLed.SetBlink(greenIntervalMs, greenOnMs, nowMs);
+        if (this->config.sleep.mode == SleepMode::Deep)
+            return;
+
+        if (sleepResult == ESP_ERR_SLEEP_REJECT ||
+            sleepResult == ESP_ERR_SLEEP_TOO_SHORT_SLEEP_DURATION ||
+            sleepResult == ESP_ERR_NOT_SUPPORTED)
+        {
+            unsigned long nowMs = millis();
+            this->startedAtMs = nowMs;
+            this->lastTelemetryAtMs = nowMs;
+            this->lastDetectionAtMs = nowMs;
+            this->irqEventHead = 0;
+            this->irqEventCount = 0;
+            this->detectionWindowIrqDelta = 0;
+            this->detectionWindowLatched = false;
+
+            if (sleepResult == ESP_ERR_NOT_SUPPORTED)
+            {
+                printf("[SENSOR][SLEEP] light sleep bypassed by build config (err=%d), retry window reset\n", (int)sleepResult);
+                esp_rom_printf("[SENSOR][SLEEP][ROM] light sleep bypassed by build config err=%d\n", (int)sleepResult);
+            }
+            else
+            {
+                printf("[SENSOR][SLEEP] light sleep rejected (err=%d), retry window reset\n", (int)sleepResult);
+                esp_rom_printf("[SENSOR][SLEEP][ROM] light sleep rejected err=%d\n", (int)sleepResult);
+            }
+            fflush(stdout);
+            return;
+        }
+
+        this->state = SensorState::Fault;
+        printf("[SENSOR][ERROR] failed to enter sleep (err=%d)\n", (int)sleepResult);
+            esp_rom_printf("[SENSOR][ERROR][ROM] failed to enter sleep err=%d\n", (int)sleepResult);
+            fflush(stdout);
+        this->Terminate();
+        return;
+    }
+
+    unsigned long wakeAtMs = millis();
+    bool wokeFromConfiguredSource = this->sleep.WokeFromConfiguredSource();
+    esp_sleep_wakeup_cause_t wakeCause = this->sleep.WakeupCause();
+    fflush(stdout);
+
+    this->startedAtMs = wakeAtMs;
+    this->lastTelemetryAtMs = wakeAtMs;
+    this->lastDetectionAtMs = wakeAtMs;
+    this->irqEventHead = 0;
+    this->irqEventCount = 0;
+    this->detectionWindowIrqDelta = 0;
+    this->detectionWindowLatched = false;
+    this->redPulseUntilAtMs = 0;
+    if (this->config.ledRed != GPIO_NONE)
         this->redLed.SetOff();
-        this->buzzer.SetOff();
-    }
 
-    this->greenLed.Update(nowMs);
-    this->redLed.Update(nowMs);
-    this->buzzer.Update(nowMs);
-}
-
-void Sensor::applySleepInMonitor()
-{
-    if (!this->config.power.deepSleepPreferred)
+    if (this->config.ledGreen != GPIO_NONE)
     {
-        delay(this->config.power.monitorSleepMs);
-        return;
+        this->greenLed.SetSolidOn();
+        this->greenWakePulseUntilAtMs = wakeAtMs + 150;
     }
 
-    if (this->config.pins.motionInterrupt != GPIO_NONE)
-    {
-        gpio_num_t wakeGpio = (gpio_num_t)this->config.pins.motionInterrupt;
-        gpio_wakeup_enable(wakeGpio, GPIO_INTR_LOW_LEVEL);
-        esp_sleep_enable_gpio_wakeup();
-    }
-
-    esp_sleep_enable_timer_wakeup((uint64_t)this->config.power.monitorSleepMs * 1000ULL);
-    esp_light_sleep_start();
-}
-
-bool Sensor::detectMotionEvent()
-{
-    const unsigned short amplitudeOnlyRequiredHits = 2;
-    const unsigned int amplitudeOnlyMaxGapMs = 450;
-    const unsigned int burstWindowMs = 90;
-    const unsigned int burstStepMs = 8;
-    const unsigned short burstRequiredHits = 2;
-    const unsigned int maxPlausibleDeltaSquared = 90000;
-    const unsigned int telemetryIntervalMs = 20;
-
-    unsigned long nowMs = millis();
-
-    auto median3 = [](short a, short b, short c) {
-        if ((a <= b && b <= c) || (c <= b && b <= a))
-            return b;
-
-        if ((b <= a && a <= c) || (c <= a && a <= b))
-            return a;
-
-        return c;
-    };
-
-    auto readStableAcceleration = [&]() {
-        Acceleration s1;
-        Acceleration s2;
-        Acceleration s3;
-        this->config.sensors.accelerometer->Read(&s1);
-        this->config.sensors.accelerometer->Read(&s2);
-        this->config.sensors.accelerometer->Read(&s3);
-
-        return Acceleration(
-            median3(s1.X, s2.X, s3.X),
-            median3(s1.Y, s2.Y, s3.Y),
-            median3(s1.Z, s2.Z, s3.Z));
-    };
-
-    if ((nowMs - this->startedAtMs) < this->config.motion.startupGraceMs)
-    {
-        // During startup grace we continuously refresh baseline and clear any latched interrupt.
-        this->config.sensors.accelerometer->Interrupting(true);
-        this->previousAcceleration = readStableAcceleration();
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionDeltaSquared = 0;
-        this->lastMotionEventHadInterrupt = false;
-        return false;
-    }
-
-    bool interruptLatched = this->config.sensors.accelerometer->Interrupting(true);
-
-    auto validateBurst = [&](unsigned int threshold, bool irqPath) {
-        if (threshold == 0)
-            threshold = 1;
-
-        unsigned long burstStartMs = millis();
-        unsigned short hits = 0;
-        unsigned int peak = this->lastMotionDeltaSquared;
-        Acceleration previous = this->previousAcceleration;
-
-        // Include the initial candidate sample in the burst decision.
-        if (this->lastMotionDeltaSquared >= threshold)
-            hits = 1;
-
-        while ((millis() - burstStartMs) < burstWindowMs)
-        {
-            delay(burstStepMs);
-
-            Acceleration sample = readStableAcceleration();
-            Acceleration sampleDelta = sample - previous;
-            previous = sample;
-
-            sampleDelta = Acceleration::Deadband(sampleDelta, (short)this->config.motion.deadband);
-            unsigned int sampleDeltaSquared = sampleDelta.LengthSquared();
-
-            // Reject physically implausible spikes that are usually bus/noise glitches.
-            if (sampleDeltaSquared > maxPlausibleDeltaSquared)
-                continue;
-
-            if (sampleDeltaSquared > peak)
-                peak = sampleDeltaSquared;
-
-            if (sampleDeltaSquared >= threshold && hits < 65535)
-                hits++;
-        }
-
-        this->previousAcceleration = previous;
-        this->lastMotionDeltaSquared = peak;
-
-        if (hits < burstRequiredHits)
-        {
-            printf("[SENSOR][MOTION] burst reject irq=%u hits=%u/%u peakD2=%u thr=%u\n",
-                   irqPath ? 1U : 0U,
-                   (unsigned int)hits,
-                   (unsigned int)burstRequiredHits,
-                   peak,
-                   threshold);
-            return false;
-        }
-
-        return true;
-    };
-
-    Acceleration current = readStableAcceleration();
-    Acceleration delta = current - this->previousAcceleration;
-    this->previousAcceleration = current;
-
-    delta = Acceleration::Deadband(delta, (short)this->config.motion.deadband);
-    unsigned int minDeltaSquared = this->config.motion.minDeltaSquared;
-    if (interruptLatched)
-    {
-        // Keep value-validation mandatory, but allow slightly higher sensitivity on confirmed IRQ events.
-        unsigned int interruptAdjusted = (this->config.motion.minDeltaSquared * 30U) / 100U;
-        if (interruptAdjusted < 700U)
-            interruptAdjusted = 700U;
-        minDeltaSquared = interruptAdjusted == 0 ? 1 : interruptAdjusted;
-    }
-
-    unsigned int deltaSquared = delta.LengthSquared();
-
-    if (deltaSquared > maxPlausibleDeltaSquared)
-    {
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionDeltaSquared = 0;
-        this->lastMotionEventHadInterrupt = false;
-        printf("[SENSOR][MOTION] glitch reject irq=%u d2=%u\n", interruptLatched ? 1U : 0U, deltaSquared);
-        return false;
-    }
-
-    this->lastMotionDeltaSquared = deltaSquared;
-
-    if (this->lastTelemetryAtMs == 0 || (nowMs - this->lastTelemetryAtMs) >= telemetryIntervalMs)
-    {
-        this->lastTelemetryAtMs = nowMs;
-        printf("[SENSOR][ACC] t=%lu irq=%u ax=%d ay=%d az=%d dx=%d dy=%d dz=%d d2=%u\n",
-               nowMs,
-               interruptLatched ? 1U : 0U,
-               current.X,
-               current.Y,
-               current.Z,
-               delta.X,
-               delta.Y,
-               delta.Z,
-               deltaSquared);
-    }
-
-    if (deltaSquared < minDeltaSquared)
-    {
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionEventHadInterrupt = false;
-        return false;
-    }
-
-    if (interruptLatched)
-    {
-        if (!validateBurst(minDeltaSquared, true))
-        {
-            this->lastAmplitudeOnlyHitAtMs = 0;
-            this->amplitudeOnlyHits = 0;
-            this->lastMotionEventHadInterrupt = false;
-            return false;
-        }
-
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionEventHadInterrupt = true;
-        return true;
-    }
-
-    // If dedicated interrupt wiring is present, require IRQ evidence.
-    // This avoids periodic amplitude-only noise causing false warnings while idle.
-    if (this->config.pins.motionInterrupt != GPIO_NONE)
-    {
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionEventHadInterrupt = false;
-        return false;
-    }
-
-    // Without IRQ we require a clearly stronger signal across several reads
-    // to avoid stationary jitter becoming warnings.
-    unsigned int amplitudeOnlyMinDeltaSquared = this->config.motion.minDeltaSquared;
-    if (deltaSquared < amplitudeOnlyMinDeltaSquared)
-    {
-        this->lastAmplitudeOnlyHitAtMs = 0;
-        this->amplitudeOnlyHits = 0;
-        this->lastMotionEventHadInterrupt = false;
-        return false;
-    }
-
-    if (this->lastAmplitudeOnlyHitAtMs == 0 || (nowMs - this->lastAmplitudeOnlyHitAtMs) > amplitudeOnlyMaxGapMs)
-        this->amplitudeOnlyHits = 1;
-    else if (this->amplitudeOnlyHits < 255)
-        this->amplitudeOnlyHits++;
-
-    this->lastAmplitudeOnlyHitAtMs = nowMs;
-
-    if (this->amplitudeOnlyHits < amplitudeOnlyRequiredHits)
-    {
-        this->lastMotionEventHadInterrupt = false;
-        return false;
-    }
-
-    this->lastAmplitudeOnlyHitAtMs = 0;
-    this->amplitudeOnlyHits = 0;
-
-    printf("[SENSOR][MOTION] amplitude-only confirmed (%u samples), delta2=%u\n",
-           (unsigned int)amplitudeOnlyRequiredHits,
-           deltaSquared);
-
-    this->lastMotionEventHadInterrupt = false;
-
-    return true;
-}
-
-void Sensor::pollIncomingFrames()
-{
-    int count = this->config.radio.transceiver->Receive(this->rxBuffer,
-                                                        this->config.radio.packetLength,
-                                                        this->config.radio.receiveTimeoutMs);
-
-    if (count != this->config.radio.packetLength)
-    {
-        if (count <= 0)
-            this->stats.rxTimeouts++;
-
-        return;
-    }
-
-    PackageHeader header;
-    unsigned short payloadLength = 0;
-    if (!Package::Decode(this->rxBuffer,
-                         this->config.radio.packetLength,
-                         &header,
-                         this->payloadBuffer,
-                         sizeof(this->payloadBuffer),
-                         &payloadLength))
-    {
-        this->stats.rxInvalid++;
-        return;
-    }
-
-    if (header.type == PackageType::Ack)
-    {
-        this->stats.ackRx++;
-        printf("[SENSOR][RX] ack seq=%u\n", header.sequence);
-    }
-    else if (header.type == PackageType::Status)
-        this->stats.statusRx++;
-}
-
-bool Sensor::sendAlarmFrame(unsigned long nowMs)
-{
-    if (this->gpsAvailable)
-    {
-        this->config.sensors.gps->Read(&this->lastLocation);
-        this->stats.gpsReads++;
-        if (this->lastLocation.fix)
-            this->stats.gpsFixes++;
-    }
-
-    memset(this->payloadBuffer, 0, sizeof(this->payloadBuffer));
-    if (this->gpsAvailable && this->lastLocation.fix)
-    {
-        long latE5 = (long)(this->lastLocation.coordinate.X * 100000.0f);
-        long lonE5 = (long)(this->lastLocation.coordinate.Y * 100000.0f);
-
-        snprintf((char *)this->payloadBuffer,
-                 sizeof(this->payloadBuffer),
-                 "ev:%lu id:%u gps:1 latE5:%ld lonE5:%ld sat:%u",
-                 nowMs,
-                 this->config.privacy.pseudonymousDeviceId,
-                 latE5,
-                 lonE5,
-                 this->lastLocation.satellites);
-    }
-    else
-    {
-        snprintf((char *)this->payloadBuffer,
-                 sizeof(this->payloadBuffer),
-                 "ev:%lu id:%u gps:0",
-                 nowMs,
-                 this->config.privacy.pseudonymousDeviceId);
-    }
-
-    return this->transmitFrame(PackageType::Alarm, (const char *)this->payloadBuffer);
-}
-
-bool Sensor::sendWarningFrame(unsigned long nowMs)
-{
-    memset(this->payloadBuffer, 0, sizeof(this->payloadBuffer));
-    snprintf((char *)this->payloadBuffer,
-             sizeof(this->payloadBuffer),
-             "warn:%lu id:%u win:%u",
-             nowMs,
-             this->config.privacy.pseudonymousDeviceId,
-             this->config.alarm.warningWindowMs);
-
-    return this->transmitFrame(PackageType::Control, (const char *)this->payloadBuffer);
-}
-
-bool Sensor::sendStatusFrame(unsigned long nowMs)
-{
-    memset(this->payloadBuffer, 0, sizeof(this->payloadBuffer));
-    snprintf((char *)this->payloadBuffer,
-             sizeof(this->payloadBuffer),
-             "hb:%lu st:%u bz:%u id:%u gps:%u",
-             nowMs,
-             (unsigned int)this->state,
-             this->config.indicators.buzzerEnabled ? 1U : 0U,
-             this->config.privacy.pseudonymousDeviceId,
-             this->gpsAvailable ? 1U : 0U);
-
-    return this->transmitFrame(PackageType::Status, (const char *)this->payloadBuffer);
-}
-
-bool Sensor::transmitFrame(PackageType type, const char *payloadText)
-{
-    if (payloadText == nullptr)
-        return false;
-
-    memset(this->txBuffer, 0, this->config.radio.packetLength);
-
-    unsigned short maxPayloadLength = Package::MaxPayloadLength(this->config.radio.packetLength);
-    unsigned short payloadLength = (unsigned short)strlen(payloadText);
-    if (payloadLength > maxPayloadLength)
-        payloadLength = maxPayloadLength;
-
-    PackageHeader header;
-    header.type = type;
-    header.sequence = this->sequence++;
-
-    unsigned short written = 0;
-    if (!Package::Encode(header,
-                         (const Byte *)payloadText,
-                         payloadLength,
-                         this->txBuffer,
-                         this->config.radio.packetLength,
-                         &written))
-        return false;
-
-    printf("[SENSOR][TX] type=%u seq=%u payloadLen=%u payload='%.*s'\n",
-           (unsigned int)type,
-           (unsigned int)header.sequence,
-           (unsigned int)payloadLength,
-           (int)payloadLength,
-           payloadText);
-
-    return this->config.radio.transceiver->Send(this->txBuffer, this->config.radio.packetLength);
-}
-
-const char *Sensor::stateName(SensorState state)
-{
-    switch (state)
-    {
-    case SensorState::Boot:
-        return "boot";
-    case SensorState::ProbePeripherals:
-        return "probe";
-    case SensorState::ArmAndSleep:
-        return "arm-sleep";
-    case SensorState::WakeValidateMotion:
-        return "wake-validate";
-    case SensorState::WarningActive:
-        return "warning";
-    case SensorState::AlarmActive:
-        return "alarm";
-    case SensorState::AlarmCooldown:
-        return "cooldown";
-    case SensorState::Fault:
-        return "fault";
-    default:
-        return "unknown";
-    }
+    this->pendingWakeFromConfiguredSource = wokeFromConfiguredSource;
+    this->pendingWakeCause = wakeCause;
+    this->pendingWakeLog = true;
 }

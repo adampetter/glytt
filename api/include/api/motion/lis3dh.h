@@ -34,6 +34,14 @@ enum Lis3dhMode
     Lis3dhMode_Stream_Fifo = 0xC0
 };
 
+enum Lis3dhRange
+{
+    Lis3dhRange_2G = 0x00,
+    Lis3dhRange_4G = 0x10,
+    Lis3dhRange_8G = 0x20,
+    Lis3dhRange_16G = 0x30
+};
+
 enum Lis3dhThreshold
 {
     Lis3dhThreshold_0 = 2,
@@ -55,7 +63,14 @@ struct Lis3dhConfig
     Lis3dhMode mode = Lis3dhMode::Lis3dhMode_ByPass;
     Lis3dhSampleRate sampleRate = Lis3dhSampleRate::Lis3dhSampleRate_10;
     Lis3dhAxis axis = Lis3dhAxis::Lis3dhAxis_All;
+    Lis3dhRange range = Lis3dhRange::Lis3dhRange_2G;
+    bool highResolution = true;
+    bool blockDataUpdate = true;
     GpioNum interrupt = GPIO_NONE;
+    bool interruptActiveLow = false;
+    bool interruptLatched = true;
+    bool highPassOnInterrupt = true;
+    Byte interruptConfig = 0x2A; // OR mode, high event on XYZ
     Byte interruptDuration = 1;
     Lis3dhThreshold interruptThreshold = Lis3dhThreshold::Lis3dhThreshold_3;   
     Byte wakeupDuration = 2; 
