@@ -2,6 +2,7 @@
 
 #include "api/io/i2c.h"
 #include "api/motion/lis3dh.h"
+#include "api/navigation/pa1010d.h"
 #include "sensor.h"
 
 extern "C" void app_main(void)
@@ -75,6 +76,19 @@ extern "C" void app_main(void)
     else
         printf("[SENSOR][ACC][WARN] LIS3DH not found on 0x18/0x19\n");
 
+    PA1010D *gps = nullptr;
+    if (sensorI2c->Exists(PA1010D_I2C_DEFAULT_ADDRESS))
+    {
+        gps = new PA1010D({.i2c = sensorI2c,
+                           .address = PA1010D_I2C_DEFAULT_ADDRESS,
+                           .refreshRateSeconds = 1});
+        printf("[SENSOR][GPS] PA1010D ready at 0x%02X\n", PA1010D_I2C_DEFAULT_ADDRESS);
+    }
+    else
+    {
+        printf("[SENSOR][GPS][WARN] PA1010D not found at 0x%02X\n", PA1010D_I2C_DEFAULT_ADDRESS);
+    }
+
     SensorConfig config;
     config.rate = 30;                 // 60 Hz loop for tighter motion tracking.
     config.ledGreen = (GpioNum)11;    // Optional heartbeat LED.
@@ -87,12 +101,17 @@ extern "C" void app_main(void)
     config.detectionIrqThreshold = 1;
     config.detectionWindowMs = 500;
     config.detectionPulseMs = 500;
+    config.alarmDetectionCount = 2;
+    config.alarmDetectionWindowMs = 5000;
+    config.alarmDurationMs = 60000;
+    config.alarmBlinkIntervalMs = 500;
     config.noDetectionSleepMs = 10000;
     config.sleep.enabled = true;
     config.sleep.wakePin = lis3dhInterruptPin;
     config.sleep.wakeOnLow = interruptActiveLow;
     config.sleep.mode = SleepMode::Light;
     config.accelerometer = lis3dh;
+    config.gps = gps;
 
     Sensor sensor(config);
 

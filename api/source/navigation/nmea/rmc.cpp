@@ -61,7 +61,12 @@ RMC::RMC(const char *sentence)
         unsigned short year = this->datetime.Year();
         Byte month = this->datetime.Month();
         Byte day = this->datetime.Day();
-        Nmea::Date(tokens[9], &year, &month, &day);
+        if (Nmea::Date(tokens[9], &year, &month, &day))
+        {
+            this->datetime.Year(year);
+            this->datetime.Month(month);
+            this->datetime.Day(day);
+        }
 
         // TODO: add magnetic variation
 
