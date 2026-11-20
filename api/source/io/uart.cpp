@@ -91,3 +91,12 @@ void Uart::Disable(UartPort port){
 UartBaudrate Uart::BaudRate(){
     return this->config.baudRate;
 }
+
+bool Uart::SetBaudRate(UartBaudrate baudRate)
+{
+    esp_err_t err = uart_set_baudrate((uart_port_t)this->config.port, (uint32_t)baudRate);
+    if (err == ESP_OK)
+        this->config.baudRate = baudRate;
+
+    return err == ESP_OK;
+}

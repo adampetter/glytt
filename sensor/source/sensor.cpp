@@ -1,4 +1,4 @@
-#include "sensor.h"
+﻿#include "sensor.h"
 #include "config.h"
 #include "api/common/time.h"
 #include "api/transmission/package.h"
@@ -9,12 +9,11 @@
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
 
-static const unsigned int GreenMonitorBlinkIntervalMs = 30000;
-static const unsigned int GreenMonitorBlinkOnMs = 100;
 static const unsigned short AlarmPacketLength = 240;
 static const unsigned short AlarmPayloadMax = AlarmPacketLength - Package::HeaderSize;
 static Byte AlarmPacketBuffer[AlarmPacketLength] = {0};
 static char AlarmPayloadBuffer[AlarmPayloadMax + 1] = {0};
+static char StatusPayloadBuffer[AlarmPayloadMax + 1] = {0};
 
 Sensor::Sensor(const SensorConfig &config)
     : Loop(config.rate), config(config), sleep(config.sleep)
@@ -23,15 +22,20 @@ Sensor::Sensor(const SensorConfig &config)
 
 bool Sensor::Start()
 {
-    this->state = SensorState::Running;
-    this->mode = SensorMode::Monitor;
+    this->state = SensorState::Ready;
     this->startedAtMs = millis();
     this->lastTelemetryAtMs = this->startedAtMs;
     this->lastDetectionAtMs = this->startedAtMs;
     this->alarmStartedAtMs = 0;
     this->alarmLastToggleAtMs = 0;
+    this->alarmLastRadioAtMs = 0;
+    this->statusLastRadioAtMs = 0;
     this->alarmOutputOn = false;
     this->alarmPackageSequence = 0;
+    this->lastRxAtMs = this->startedAtMs;
+    this->lastHeartbeatAtMs = this->startedAtMs;
+    this->rxPackets = 0;
+    this->rxInvalid = 0;
     this->warnedMissingAccelerometer = false;
     this->lastAcceleration = Acceleration::Empty;
     this->sampleCount = 0;
@@ -44,13 +48,23 @@ bool Sensor::Start()
     this->detectionEventCount = 0;
     this->detectionWindowLatched = false;
     this->redPulseUntilAtMs = 0;
-    this->greenBlinkStartedAtMs = this->startedAtMs;
     this->greenBlinkUntilAtMs = 0;
+    this->statusLedBlinkStartedAtMs = this->startedAtMs;
+    this->statusLedBlinkUntilAtMs = 0;
+    this->modeSignalUntilAtMs = 0;
 
     if (this->config.ledGreen != GPIO_NONE)
     {
         this->greenLed.Begin(this->config.ledGreen, this->config.ledActiveLow);
-        this->greenLed.SetOff();
+        this->greenLed.SetSolidOn();
+        this->greenBlinkUntilAtMs = this->startedAtMs + 2000;
+    }
+
+    if (this->config.ledStatus != GPIO_NONE)
+    {
+        this->statusLed.Begin(this->config.ledStatus, this->config.ledActiveLow);
+        this->statusLed.SetSolidOn();
+        this->modeSignalUntilAtMs = this->startedAtMs + 2000;
     }
 
     if (this->config.ledRed != GPIO_NONE)
@@ -59,7 +73,10 @@ bool Sensor::Start()
         this->redLed.SetOff();
     }
 
-#if BUZZER
+    this->BeginMode(this->config.startInReceiveAlarm ? SensorMode::ReceiveAlarm : SensorMode::AlarmSend,
+                    this->startedAtMs);
+
+#if SENSOR_BUZZER
     if (this->config.buzzer != GPIO_NONE)
     {
         this->buzzer.Begin(this->config.buzzer, this->config.buzzerActiveLow);
@@ -82,10 +99,10 @@ bool Sensor::Start()
         this->config.detectionPulseMs = 500;
 
     if (this->config.alarmDetectionCount == 0)
-        this->config.alarmDetectionCount = 2;
+        this->config.alarmDetectionCount = 3;
 
     if (this->config.alarmDetectionWindowMs == 0)
-        this->config.alarmDetectionWindowMs = 5000;
+        this->config.alarmDetectionWindowMs = 10000;
 
     if (this->config.alarmDurationMs == 0)
         this->config.alarmDurationMs = 60000;
@@ -93,7 +110,19 @@ bool Sensor::Start()
     if (this->config.alarmBlinkIntervalMs == 0)
         this->config.alarmBlinkIntervalMs = 500;
 
-    if (!this->sleep.Ready())
+    if (this->config.alarmRadioIntervalMs == 0)
+        this->config.alarmRadioIntervalMs = 5000;
+
+    if (this->config.statusRadioIntervalMs == 0)
+        this->config.statusRadioIntervalMs = 1200000;
+
+    if (this->config.armedBlinkIntervalMs == 0)
+        this->config.armedBlinkIntervalMs = 30000;
+
+    if (this->config.armedBlinkOnMs == 0)
+        this->config.armedBlinkOnMs = 100;
+
+    if (!this->config.startInReceiveAlarm && !this->sleep.Ready())
     {
         this->state = SensorState::Fault;
         printf("[SENSOR][ERROR] invalid sleep wake pin: %d\n", this->config.sleep.wakePin);
@@ -102,7 +131,7 @@ bool Sensor::Start()
 
     printf("[SENSOR] started target=%ums\n", this->Target());
 
-    if (this->config.sleep.enabled)
+    if (!this->config.startInReceiveAlarm && this->config.sleep.enabled)
     {
          printf("[SENSOR][SLEEP] wakePin=%d wakeLevel=%s noDetectionSleepMs=%ums wakeCause=%d\n",
                this->config.sleep.wakePin,
@@ -111,10 +140,15 @@ bool Sensor::Start()
                              (int)this->sleep.WakeupCause());
     }
 
+    if (!this->config.startInReceiveAlarm)
+    {
         printf("[SENSOR][DETECT] threshold=%u windowMs=%u pulseMs=%u\n",
-            this->config.detectionIrqThreshold,
-            this->config.detectionWindowMs,
-            this->config.detectionPulseMs);
+               this->config.detectionIrqThreshold,
+               this->config.detectionWindowMs,
+               this->config.detectionPulseMs);
+    }
+
+    this->SendStatusPacket(this->startedAtMs);
 
     return true;
 }
@@ -123,7 +157,7 @@ void Sensor::Execute(const FrameTime &time)
 {
     (void)time;
 
-    if (this->state != SensorState::Running)
+    if (this->state != SensorState::Ready && this->state != SensorState::Active)
         return;
 
     if (this->pendingWakeLog)
@@ -145,25 +179,70 @@ void Sensor::Execute(const FrameTime &time)
 
     unsigned long nowMs = millis();
 
+    if (this->config.ledGreen != GPIO_NONE &&
+        this->greenBlinkUntilAtMs != 0 &&
+        nowMs >= this->greenBlinkUntilAtMs)
+    {
+        this->greenBlinkUntilAtMs = 0;
+        this->greenLed.SetOff();
+    }
+
+    if (this->config.ledStatus != GPIO_NONE &&
+        this->modeSignalUntilAtMs != 0 &&
+        nowMs >= this->modeSignalUntilAtMs)
+    {
+        this->modeSignalUntilAtMs = 0;
+        this->statusLed.SetOff();
+    }
+
+    if (this->config.ledStatus != GPIO_NONE &&
+        this->statusLedBlinkUntilAtMs != 0 &&
+        nowMs >= this->statusLedBlinkUntilAtMs)
+    {
+        this->statusLedBlinkUntilAtMs = 0;
+        this->statusLed.SetOff();
+    }
+
     if (this->mode == SensorMode::Alarm)
     {
         this->UpdateAlarm(nowMs);
         return;
     }
 
-    if (this->mode == SensorMode::Monitor && this->config.ledGreen != GPIO_NONE)
+    if (this->mode == SensorMode::ReceiveAlarm)
     {
-        if (this->greenBlinkUntilAtMs != 0 && nowMs >= this->greenBlinkUntilAtMs)
+        this->UpdateReceiveAlarm(nowMs);
+
+        if ((nowMs - this->lastHeartbeatAtMs) >= 5000)
         {
-            this->greenBlinkUntilAtMs = 0;
-            this->greenLed.SetOff();
+            this->lastHeartbeatAtMs = nowMs;
+            printf("[SENSOR][ALIVE] mode=receive state=%u rx=%lu invalid=%lu lastRxAgo=%lums\n",
+                   (unsigned int)this->state,
+                   this->rxPackets,
+                   this->rxInvalid,
+                   nowMs - this->lastRxAtMs);
         }
 
-        if ((nowMs - this->greenBlinkStartedAtMs) >= GreenMonitorBlinkIntervalMs)
+#if SENSOR_BUZZER
+        this->buzzer.Update(nowMs);
+#endif
+        return;
+    }
+
+    if ((nowMs - this->statusLastRadioAtMs) >= this->config.statusRadioIntervalMs)
+        this->SendStatusPacket(nowMs);
+
+    if (this->state == SensorState::Ready &&
+        (this->mode == SensorMode::AlarmSend || this->mode == SensorMode::ReceiveAlarm) &&
+        this->config.ledStatus != GPIO_NONE)
+    {
+        bool greenBlinkActive = this->greenBlinkUntilAtMs != 0;
+        if (!greenBlinkActive && this->modeSignalUntilAtMs == 0 &&
+            (nowMs - this->statusLedBlinkStartedAtMs) >= this->config.armedBlinkIntervalMs)
         {
-            this->greenBlinkStartedAtMs = nowMs;
-            this->greenBlinkUntilAtMs = nowMs + GreenMonitorBlinkOnMs;
-            this->greenLed.SetSolidOn();
+            this->statusLedBlinkStartedAtMs = nowMs;
+            this->statusLedBlinkUntilAtMs = nowMs + this->config.armedBlinkOnMs;
+            this->statusLed.SetSolidOn();
         }
     }
 
@@ -212,7 +291,7 @@ void Sensor::Execute(const FrameTime &time)
                     this->redPulseUntilAtMs = nowMs + this->config.detectionPulseMs;
                 }
 
-#if BUZZER
+#if SENSOR_BUZZER
                 this->buzzer.SetSolidOn();
                 this->buzzer.Update(nowMs);
 #endif
@@ -249,24 +328,25 @@ void Sensor::Execute(const FrameTime &time)
         this->redPulseUntilAtMs = 0;
         this->redLed.SetOff();
 
-#if BUZZER
+#if SENSOR_BUZZER
         this->buzzer.SetOff();
         this->buzzer.Update(nowMs);
 #endif
     }
 
-#if BUZZER
+#if SENSOR_BUZZER
     this->buzzer.Update(nowMs);
 #endif
 
     if (this->config.sleep.enabled && (nowMs - this->lastDetectionAtMs) >= this->config.noDetectionSleepMs)
     {
-        this->mode = SensorMode::Sleep;
+        this->state = SensorState::Sleep;
         printf("[SENSOR][SLEEP] no detection for %ums, entering sleep\n", this->config.noDetectionSleepMs);
         esp_rom_printf("[SENSOR][SLEEP][ROM] entering sleep\n");
         fflush(stdout);
         this->Sleep();
-        this->mode = SensorMode::Monitor;
+        this->state = SensorState::Ready;
+        this->BeginMode(SensorMode::AlarmSend, nowMs);
         fflush(stdout);
         return;
     }
@@ -303,17 +383,20 @@ void Sensor::Execute(const FrameTime &time)
 
 void Sensor::Stop()
 {
-    this->state = SensorState::Stopped;
-    this->mode = SensorMode::Monitor;
+    this->state = SensorState::Disabled;
+    this->mode = SensorMode::Disabled;
     this->Terminate();
 
-#if BUZZER
+#if SENSOR_BUZZER
     this->buzzer.SetOff();
     this->buzzer.Update(millis());
 #endif
 
     if (this->config.ledGreen != GPIO_NONE)
         this->greenLed.SetOff();
+
+    if (this->config.ledStatus != GPIO_NONE)
+        this->statusLed.SetOff();
 
     if (this->config.ledRed != GPIO_NONE)
         this->redLed.SetOff();
@@ -328,15 +411,21 @@ SensorState Sensor::State() const
 
 void Sensor::Sleep()
 {
-    this->mode = SensorMode::Sleep;
+    this->state = SensorState::Sleep;
 
     if (this->config.ledGreen != GPIO_NONE)
     {
         this->greenLed.SetOff();
-        this->greenBlinkUntilAtMs = 0;
     }
 
-#if BUZZER
+    if (this->config.ledStatus != GPIO_NONE)
+    {
+        this->statusLed.SetOff();
+        this->greenBlinkUntilAtMs = 0;
+        this->statusLedBlinkUntilAtMs = 0;
+    }
+
+#if SENSOR_BUZZER
     this->buzzer.SetOff();
     this->buzzer.Update(millis());
 #endif
@@ -354,7 +443,8 @@ void Sensor::Sleep()
         this->lastDetectionAtMs = millis();
         printf("[SENSOR][SLEEP] wake pin already active on GPIO%d, delaying sleep\n", this->config.sleep.wakePin);
         fflush(stdout);
-        this->mode = SensorMode::Monitor;
+        this->state = SensorState::Ready;
+        this->BeginMode(SensorMode::AlarmSend, millis());
         return;
     }
 
@@ -369,7 +459,7 @@ void Sensor::Sleep()
     bool enteredSleep = false;
     esp_err_t sleepResult = ESP_ERR_NOT_SUPPORTED;
 
-#if DEBUG
+#if SENSOR_DEBUG
     printf("[SENSOR][SLEEP] developer bypass active, skipping Sleep::Begin\n");
     esp_rom_printf("[SENSOR][SLEEP][ROM] developer bypass active\n");
 #else
@@ -381,7 +471,8 @@ void Sensor::Sleep()
     {
         if (this->config.sleep.mode == SleepMode::Deep)
         {
-            this->mode = SensorMode::Monitor;
+            this->state = SensorState::Ready;
+            this->BeginMode(SensorMode::AlarmSend, millis());
             return;
         }
 
@@ -409,7 +500,8 @@ void Sensor::Sleep()
                 esp_rom_printf("[SENSOR][SLEEP][ROM] light sleep rejected err=%d\n", (int)sleepResult);
             }
             fflush(stdout);
-            this->mode = SensorMode::Monitor;
+            this->state = SensorState::Ready;
+            this->BeginMode(SensorMode::AlarmSend, nowMs);
             return;
         }
 
@@ -418,7 +510,7 @@ void Sensor::Sleep()
             esp_rom_printf("[SENSOR][ERROR][ROM] failed to enter sleep err=%d\n", (int)sleepResult);
             fflush(stdout);
         this->Terminate();
-        this->mode = SensorMode::Monitor;
+        this->BeginMode(SensorMode::AlarmSend, millis());
         return;
     }
 
@@ -430,8 +522,9 @@ void Sensor::Sleep()
     this->startedAtMs = wakeAtMs;
     this->lastTelemetryAtMs = wakeAtMs;
     this->lastDetectionAtMs = wakeAtMs;
-    this->greenBlinkStartedAtMs = wakeAtMs;
     this->greenBlinkUntilAtMs = 0;
+    this->statusLedBlinkStartedAtMs = wakeAtMs;
+    this->statusLedBlinkUntilAtMs = 0;
     this->irqEventHead = 0;
     this->irqEventCount = 0;
     this->detectionWindowIrqDelta = 0;
@@ -443,16 +536,26 @@ void Sensor::Sleep()
     if (this->config.ledGreen != GPIO_NONE)
         this->greenLed.SetOff();
 
+    if (this->config.ledStatus != GPIO_NONE)
+        this->statusLed.SetOff();
+
     this->pendingWakeFromConfiguredSource = wokeFromConfiguredSource;
     this->pendingWakeCause = wakeCause;
     this->pendingWakeLog = true;
-    this->mode = SensorMode::Monitor;
+    this->state = SensorState::Ready;
+    this->BeginMode(SensorMode::AlarmSend, wakeAtMs);
+}
+
+void Sensor::BeginMode(SensorMode mode, unsigned long nowMs)
+{
+    (void)nowMs;
+    this->mode = mode;
 }
 
 void Sensor::PushDetectionEvent(unsigned long nowMs)
 {
     if (this->config.alarmDetectionWindowMs == 0)
-        this->config.alarmDetectionWindowMs = 5000;
+        this->config.alarmDetectionWindowMs = 10000;
 
     while (this->detectionEventCount > 0)
     {
@@ -479,20 +582,27 @@ void Sensor::PushDetectionEvent(unsigned long nowMs)
 
 void Sensor::EnterAlarm(unsigned long nowMs)
 {
-    this->mode = SensorMode::Alarm;
+    this->state = SensorState::Active;
+    this->BeginMode(SensorMode::Alarm, nowMs);
     this->alarmStartedAtMs = nowMs;
     this->alarmLastToggleAtMs = nowMs;
+    this->alarmLastRadioAtMs = 0;
     this->alarmOutputOn = true;
     this->redPulseUntilAtMs = 0;
-    this->greenBlinkUntilAtMs = 0;
 
     if (this->config.ledGreen != GPIO_NONE)
-        this->greenLed.SetOff();
+    {
+        // Keep startup power indicator visible for the configured boot window in all modes.
+        if (this->greenBlinkUntilAtMs == 0 || nowMs >= this->greenBlinkUntilAtMs)
+            this->greenLed.SetOff();
+    }
 
     if (this->config.ledRed != GPIO_NONE)
         this->redLed.SetSolidOn();
+    else if (this->config.ledStatus != GPIO_NONE)
+        this->statusLed.SetSolidOn();
 
-#if BUZZER
+#if SENSOR_BUZZER
     this->buzzer.SetSolidOn();
     this->buzzer.Update(nowMs);
 #endif
@@ -500,6 +610,16 @@ void Sensor::EnterAlarm(unsigned long nowMs)
     printf("[SENSOR][ALARM] entered (detections=%u within %ums)\n",
            this->detectionEventCount,
            this->config.alarmDetectionWindowMs);
+
+    this->SendAlarmPacket(nowMs);
+}
+
+void Sensor::SendAlarmPacket(unsigned long nowMs)
+{
+#if !SENSOR_TRANSMIT
+    (void)nowMs;
+    return;
+#endif
 
     Location location;
     if (this->config.gps != nullptr)
@@ -558,26 +678,144 @@ void Sensor::EnterAlarm(unsigned long nowMs)
            (unsigned int)written,
            (int)payloadLength,
            AlarmPayloadBuffer);
+
+    if (this->config.transceiver == nullptr)
+    {
+        printf("[SENSOR][ALARM][TX][WARN] transceiver not configured\n");
+        return;
+    }
+
+    unsigned short packetLength = this->config.radioPacketLength;
+    if (packetLength == 0 || packetLength > AlarmPacketLength)
+        packetLength = AlarmPacketLength;
+
+    if (!this->config.transceiver->Send(AlarmPacketBuffer, packetLength))
+    {
+        printf("[SENSOR][ALARM][TX][WARN] send failed len=%u\n", (unsigned int)packetLength);
+        return;
+    }
+
+    this->alarmLastRadioAtMs = nowMs;
+
+    printf("[SENSOR][ALARM][TX] sent len=%u seq=%u\n",
+           (unsigned int)packetLength,
+           (unsigned int)header.sequence);
+}
+
+void Sensor::SendStatusPacket(unsigned long nowMs)
+{
+#if !SENSOR_TRANSMIT
+    (void)nowMs;
+    return;
+#endif
+
+    if (this->config.transceiver == nullptr)
+    {
+        printf("[SENSOR][STATUS][TX][WARN] transceiver not configured\n");
+        return;
+    }
+
+    memset(StatusPayloadBuffer, 0, sizeof(StatusPayloadBuffer));
+    int payloadChars = snprintf(StatusPayloadBuffer,
+                                sizeof(StatusPayloadBuffer),
+                                "status|state=%u|mode=%u|uptime=%lu|seq=%u",
+                                (unsigned int)this->state,
+                                (unsigned int)this->mode,
+                                nowMs - this->startedAtMs,
+                                (unsigned int)this->alarmPackageSequence);
+
+    if (payloadChars < 0)
+    {
+        printf("[SENSOR][STATUS][PKG][ERROR] failed to format payload\n");
+        return;
+    }
+
+    unsigned short payloadLength = (unsigned short)payloadChars;
+    if (payloadLength > AlarmPayloadMax)
+        payloadLength = AlarmPayloadMax;
+
+    memset(AlarmPacketBuffer, 0, sizeof(AlarmPacketBuffer));
+    PackageHeader header;
+    header.type = PackageType::Status;
+    header.sequence = this->alarmPackageSequence++;
+    header.flags = 0;
+    header.meta = 0;
+
+    unsigned short written = 0;
+    if (!Package::Encode(header,
+                         (const Byte *)StatusPayloadBuffer,
+                         payloadLength,
+                         AlarmPacketBuffer,
+                         AlarmPacketLength,
+                         &written))
+    {
+        printf("[SENSOR][STATUS][PKG][ERROR] encode failed payloadLen=%u\n", payloadLength);
+        return;
+    }
+
+    unsigned short packetLength = this->config.radioPacketLength;
+    if (packetLength == 0 || packetLength > AlarmPacketLength)
+        packetLength = AlarmPacketLength;
+
+    if (!this->config.transceiver->Send(AlarmPacketBuffer, packetLength))
+    {
+        printf("[SENSOR][STATUS][TX][WARN] send failed len=%u\n", (unsigned int)packetLength);
+        return;
+    }
+
+    this->statusLastRadioAtMs = nowMs;
+    printf("[SENSOR][STATUS][TX] sent len=%u seq=%u\n",
+           (unsigned int)packetLength,
+           (unsigned int)header.sequence);
+}
+
+void Sensor::ForceAlarmOutputsHigh(unsigned long nowMs)
+{
+    if (this->config.ledRed != GPIO_NONE)
+        this->redLed.SetSolidOn();
+    else if (this->config.ledStatus != GPIO_NONE)
+        this->statusLed.SetSolidOn();
+
+#if SENSOR_BUZZER
+    this->buzzer.SetSolidOn();
+    this->buzzer.Update(nowMs);
+#endif
+
+    this->alarmOutputOn = true;
 }
 
 void Sensor::UpdateAlarm(unsigned long nowMs)
 {
+    if ((nowMs - this->alarmLastRadioAtMs) >= this->config.alarmRadioIntervalMs)
+    {
+        // Keep local alarm indication high while radio TX may block for a while.
+        this->ForceAlarmOutputsHigh(nowMs);
+        this->SendAlarmPacket(nowMs);
+        this->alarmLastToggleAtMs = millis();
+        nowMs = this->alarmLastToggleAtMs;
+    }
+
     if ((nowMs - this->alarmStartedAtMs) >= this->config.alarmDurationMs)
     {
         if (this->config.ledRed != GPIO_NONE)
             this->redLed.SetOff();
+        else if (this->config.ledStatus != GPIO_NONE)
+            this->statusLed.SetOff();
 
-#if BUZZER
+#if SENSOR_BUZZER
         this->buzzer.SetOff();
         this->buzzer.Update(nowMs);
 #endif
 
-        this->mode = SensorMode::Monitor;
+        this->state = SensorState::Ready;
+        this->BeginMode(this->config.startInReceiveAlarm ? SensorMode::ReceiveAlarm : SensorMode::AlarmSend,
+                nowMs);
         this->lastDetectionAtMs = nowMs;
         this->detectionEventHead = 0;
         this->detectionEventCount = 0;
         this->detectionWindowLatched = false;
-        printf("[SENSOR][ALARM] finished, back to monitor\n");
+        this->SendStatusPacket(nowMs);
+        printf("[SENSOR][ALARM] finished, back to ready/alarm-send\n");
         return;
     }
 
@@ -593,8 +831,15 @@ void Sensor::UpdateAlarm(unsigned long nowMs)
             else
                 this->redLed.SetOff();
         }
+        else if (this->config.ledStatus != GPIO_NONE)
+        {
+            if (this->alarmOutputOn)
+                this->statusLed.SetSolidOn();
+            else
+                this->statusLed.SetOff();
+        }
 
-#if BUZZER
+#if SENSOR_BUZZER
         if (this->alarmOutputOn)
             this->buzzer.SetSolidOn();
         else
@@ -604,3 +849,85 @@ void Sensor::UpdateAlarm(unsigned long nowMs)
 #endif
     }
 }
+
+bool Sensor::UpdateReceiveAlarm(unsigned long nowMs)
+{
+    if (this->config.transceiver == nullptr)
+        return false;
+
+    static Byte reassemblyBuffer[AlarmPacketLength] = {0};
+    static unsigned short reassemblyUsed = 0;
+
+    unsigned short packetLength = this->config.radioPacketLength;
+    if (packetLength == 0 || packetLength > AlarmPacketLength)
+        packetLength = AlarmPacketLength;
+
+    int received = this->config.transceiver->Receive(AlarmPacketBuffer,
+                                                     packetLength,
+                                                     this->config.receiveTimeoutMs);
+    if (received <= 0)
+        return false;
+
+    // Reassemble fixed-size packets across multiple reads. Some modules deliver
+    // a single over-the-air packet in several UART chunks.
+    unsigned short receivedBytes = (unsigned short)received;
+    if ((unsigned int)reassemblyUsed + (unsigned int)receivedBytes > packetLength)
+        reassemblyUsed = 0;
+
+    memcpy(&reassemblyBuffer[reassemblyUsed], AlarmPacketBuffer, receivedBytes);
+    reassemblyUsed = (unsigned short)(reassemblyUsed + receivedBytes);
+
+    if (reassemblyUsed < packetLength)
+        return false;
+
+    memcpy(AlarmPacketBuffer, reassemblyBuffer, packetLength);
+    reassemblyUsed = 0;
+
+    PackageHeader header;
+    static Byte payload[AlarmPacketLength] = {0};
+    unsigned short payloadLength = 0;
+    if (!Package::Decode(AlarmPacketBuffer,
+                         (unsigned short)received,
+                         &header,
+                         payload,
+                         sizeof(payload),
+                         &payloadLength))
+    {
+        this->rxInvalid++;
+        printf("[SENSOR][RX][WARN] invalid package bytes=%d\n", received);
+        return false;
+    }
+
+    this->lastRxAtMs = nowMs;
+    this->rxPackets++;
+
+    if (header.type == PackageType::Alarm)
+    {
+        this->EnterAlarm(nowMs);
+        printf("[SENSOR][RX] alarm seq=%u payloadLen=%u\n",
+               (unsigned int)header.sequence,
+               (unsigned int)payloadLength);
+        return true;
+    }
+
+    if (header.type == PackageType::Status)
+    {
+        if (this->config.ledStatus != GPIO_NONE)
+        {
+            this->statusLedBlinkUntilAtMs = nowMs + this->config.statusLedOnMs;
+            this->statusLed.SetSolidOn();
+        }
+
+        printf("[SENSOR][RX] status seq=%u payloadLen=%u\n",
+               (unsigned int)header.sequence,
+               (unsigned int)payloadLength);
+        return true;
+    }
+
+    printf("[SENSOR][RX] type=%u seq=%u payloadLen=%u\n",
+           (unsigned int)header.type,
+           (unsigned int)header.sequence,
+           (unsigned int)payloadLength);
+    return true;
+}
+

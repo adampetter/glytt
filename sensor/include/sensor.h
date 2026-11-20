@@ -8,26 +8,37 @@
 #include "api/navigation/pa1010d.h"
 #include "api/system/loop.h"
 #include "api/system/sleep.h"
+#include "api/transmission/transceiver.h"
 
 enum class SensorState
 {
     Boot = 0,
-    Running = 1,
-    Fault = 2,
-    Stopped = 3
+    Disabled = 1,
+    Sleep = 2,
+    Ready = 3,
+    Active = 4,
+    Fault = 5
 };
 
 enum class SensorMode
 {
-    Monitor = 0,
-    Sleep = 1,
-    Alarm = 2
+    Disabled = 0,
+    Alarm = 1,
+    AlarmSend = 2,
+    ReceiveAlarm = 3,
+    // Backlog, deferred modes:
+    // AlarmTrigger = 4,
+    // AlarmSendTrigger = 5,
+    // ReceiveTrigger = 6,
+    // ReceiveAlarmTrigger = 7,
+    // Track = 8
 };
 
 struct SensorConfig
 {
     Byte rate = 30;
     GpioNum ledGreen = GPIO_NONE;
+    GpioNum ledStatus = GPIO_NONE;
     GpioNum ledRed = GPIO_NONE;
     bool ledActiveLow = false;
     GpioNum buzzer = GPIO_NONE;
@@ -42,12 +53,21 @@ struct SensorConfig
     unsigned int detectionWindowMs = 2000;
     unsigned int detectionIrqThreshold = 3;
     unsigned int detectionPulseMs = 500;
-    unsigned int alarmDetectionCount = 2;
-    unsigned int alarmDetectionWindowMs = 5000;
+    unsigned int alarmDetectionCount = 3;
+    unsigned int alarmDetectionWindowMs = 10000;
     unsigned int alarmDurationMs = 60000;
     unsigned int alarmBlinkIntervalMs = 500;
+    unsigned int alarmRadioIntervalMs = 5000;
+    unsigned int statusRadioIntervalMs = 1200000;
+    unsigned int receiveTimeoutMs = 500;
+    unsigned int statusLedOnMs = 2000;
+    unsigned int armedBlinkIntervalMs = 30000;
+    unsigned int armedBlinkOnMs = 100;
+    bool startInReceiveAlarm = false;
+    unsigned short radioPacketLength = 240;
     Lis3dh *accelerometer = nullptr;
     PA1010D *gps = nullptr;
+    Transceiver *transceiver = nullptr;
 };
 
 class Sensor : public Loop
@@ -58,13 +78,20 @@ private:
     unsigned long startedAtMs = 0;
     unsigned long lastTelemetryAtMs = 0;
     unsigned long lastDetectionAtMs = 0;
-    SensorMode mode = SensorMode::Monitor;
+    SensorMode mode = SensorMode::Disabled;
     unsigned long alarmStartedAtMs = 0;
     unsigned long alarmLastToggleAtMs = 0;
+    unsigned long alarmLastRadioAtMs = 0;
+    unsigned long statusLastRadioAtMs = 0;
     bool alarmOutputOn = false;
     unsigned short alarmPackageSequence = 0;
+    unsigned long lastRxAtMs = 0;
+    unsigned long lastHeartbeatAtMs = 0;
+    unsigned long rxPackets = 0;
+    unsigned long rxInvalid = 0;
     Buzzer buzzer;
     Led greenLed;
+    Led statusLed;
     Led redLed;
     bool warnedMissingAccelerometer = false;
     Acceleration lastAcceleration = Acceleration::Empty;
@@ -82,8 +109,10 @@ private:
     unsigned int detectionEventCount = 0;
     bool detectionWindowLatched = false;
     unsigned long redPulseUntilAtMs = 0;
-    unsigned long greenBlinkStartedAtMs = 0;
     unsigned long greenBlinkUntilAtMs = 0;
+    unsigned long statusLedBlinkStartedAtMs = 0;
+    unsigned long statusLedBlinkUntilAtMs = 0;
+    unsigned long modeSignalUntilAtMs = 0;
     Sleep sleep;
     bool pendingWakeLog = false;
     bool pendingWakeFromConfiguredSource = false;
@@ -98,8 +127,13 @@ private:
 #pragma GCC diagnostic pop
 #endif
     void PushDetectionEvent(unsigned long nowMs);
+    void BeginMode(SensorMode mode, unsigned long nowMs);
+    void SendAlarmPacket(unsigned long nowMs);
+    void SendStatusPacket(unsigned long nowMs);
     void EnterAlarm(unsigned long nowMs);
+    void ForceAlarmOutputsHigh(unsigned long nowMs);
     void UpdateAlarm(unsigned long nowMs);
+    bool UpdateReceiveAlarm(unsigned long nowMs);
 
 public:
     Sensor(const SensorConfig &config);

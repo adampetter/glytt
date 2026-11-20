@@ -24,6 +24,7 @@ enum GpioPull
 class Gpio
 {
 public:
+    static bool IsValid(GpioNum gpio);
     static void Reset(GpioNum gpio);
     static void Mode(GpioNum gpio, GpioMode mode);
     static void Pull(GpioNum gpio, GpioPull pull);

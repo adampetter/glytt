@@ -5,7 +5,7 @@
       "name": "ESP-IDF: Flash + Monitor (UART)",
       "type": "node-terminal",
       "request": "launch",
-      "command": "idf.py -p ${config:idf.portWin} flash monitor"
+      "command": "idf.py -p ${config:idf.port} flash monitor"
     }
   ]
 }

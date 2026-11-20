@@ -60,6 +60,7 @@ public:
     int Read(Byte *buffer, int length = 1);
     void Flush();
     UartBaudrate BaudRate();
+    bool SetBaudRate(UartBaudrate baudRate);
 
     static void Disable(UartPort port);
 };

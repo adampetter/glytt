@@ -1,7 +1,6 @@
 set(SOURCES
-    source/tailer.cpp
-    source/app.cpp
-    source/cli.cpp)
+    source/watcher.cpp
+    source/app.cpp)
 
 idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS . include

@@ -1,16 +1,61 @@
 #include <cstdio>
 
+#include "api/common/time.h"
+#include "api/io/gpio.h"
 #include "api/io/i2c.h"
+#include "api/io/uart.h"
 #include "api/motion/lis3dh.h"
 #include "api/navigation/pa1010d.h"
+#include "api/transmission/e22900t30.h"
 #include "sensor.h"
+#include "config.h"
+
+namespace
+{
+    constexpr GpioNum RadioAuxPin = (GpioNum)1;
+    constexpr GpioNum RadioModeM0Pin = (GpioNum)4;
+    constexpr GpioNum RadioModeM1Pin = (GpioNum)7;
+}
 
 extern "C" void app_main(void)
 {
+#if SENSOR_MODE != SENSOR_MODE_ALARM_SEND && SENSOR_MODE != SENSOR_MODE_RECEIVE_ALARM && SENSOR_MODE != SENSOR_MODE_DISABLED
+#error "Invalid SENSOR_MODE value"
+#endif
+
     const GpioNum i2cSdaPin = (GpioNum)14;
     const GpioNum i2cSclPin = (GpioNum)13;
     const GpioNum lis3dhInterruptPin = (GpioNum)46;
+    const GpioNum greenLedPin = GPIO_NONE;
+#if SENSOR_LED
     const GpioNum redLedPin = (GpioNum)9;
+    const GpioNum statusLedPin = (GpioNum)10;
+#else
+    const GpioNum redLedPin = GPIO_NONE;
+    const GpioNum statusLedPin = GPIO_NONE;
+#endif
+    const GpioNum radioAuxPin = RadioAuxPin;
+    const GpioNum radioModeM0Pin = RadioModeM0Pin;
+    const GpioNum radioModeM1Pin = RadioModeM1Pin;
+
+    if (SENSOR_MODE == SENSOR_MODE_DISABLED)
+    {
+        printf("[SENSOR][MODE] Disabled (default safe mode). Use tools/set-sensor-role.ps1 to set sender/receiver.\n");
+        return;
+    }
+
+    if (!Gpio::IsValid(radioModeM0Pin) || !Gpio::IsValid(radioModeM1Pin))
+    {
+        printf("[SENSOR][RADIO][ERROR] Invalid mode pin mapping for this board. Pick two valid output GPIOs for M0/M1.\n");
+        return;
+    }
+
+    // Enforce deterministic startup mode for E22: normal mode (M0=0, M1=0).
+    Gpio::Mode(radioModeM0Pin, GpioMode::GpioMode_Input_Output);
+    Gpio::Mode(radioModeM1Pin, GpioMode::GpioMode_Input_Output);
+    Gpio::Write(radioModeM0Pin, false);
+    Gpio::Write(radioModeM1Pin, false);
+    delay(20);
 
     // IRQ sensitivity tuning:
     // Lower threshold + lower duration => more sensitive.
@@ -27,11 +72,11 @@ extern "C" void app_main(void)
     const Byte interruptConfig = 0x2A;
 
     I2c *sensorI2c = new I2c({.port = I2cPort::I2cPort_0,
-                              .sda = i2cSdaPin,
-                              .scl = i2cSclPin,
-                              .mode = I2cMode::I2cMode_Master,
-                              .frequency = I2cFrequency::I2cFrequency_01M,
-                              .internalPullup = true});
+                               .sda = i2cSdaPin,
+                               .scl = i2cSclPin,
+                               .mode = I2cMode::I2cMode_Master,
+                               .frequency = I2cFrequency::I2cFrequency_01M,
+                               .internalPullup = true});
 
     Byte lis3dhAddress = 0x18;
     if (!sensorI2c->Exists(lis3dhAddress) && sensorI2c->Exists(0x19))
@@ -89,29 +134,158 @@ extern "C" void app_main(void)
         printf("[SENSOR][GPS][WARN] PA1010D not found at 0x%02X\n", PA1010D_I2C_DEFAULT_ADDRESS);
     }
 
+    struct RadioAttempt
+    {
+        UartPort port;
+        GpioNum tx;
+        GpioNum rx;
+        GpioNum aux;
+        GpioNum m0;
+        GpioNum m1;
+        UartBaudrate baud;
+        bool startupInNormalModeOnly;
+        const char *label;
+    };
+
+    const RadioAttempt attempts[] = {
+        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 cfg-noaux 9600"},
+        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, radioModeM1Pin, radioModeM0Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 cfg-noaux-swap 9600"},
+        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, GPIO_NONE, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx5/rx6 cfg-noaux 9600"},
+        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx6/rx5 normal-only 9600"},
+        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx5/rx6 normal-only 9600"},
+        {UartPort::UartPort_1, (GpioNum)43, (GpioNum)44, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx43/rx44 normal-only 9600"},
+        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, radioAuxPin, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 aux cfg 9600"},
+        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, radioAuxPin, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx5/rx6 aux cfg 9600"},
+    };
+
+    E22900T30 *radio = nullptr;
+    const bool startInReceiveAlarm = SENSOR_MODE == SENSOR_MODE_RECEIVE_ALARM;
+    const bool requireRadioConfigReady = SENSOR_REQUIRE_RADIO_CONFIG_READY == 1;
+    for (unsigned int i = 0; i < (sizeof(attempts) / sizeof(attempts[0])); i++)
+    {
+        const RadioAttempt &attempt = attempts[i];
+
+        if (startInReceiveAlarm &&
+            attempt.startupInNormalModeOnly &&
+            attempt.tx == (GpioNum)6 &&
+            attempt.rx == (GpioNum)5)
+        {
+            printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
+                   (unsigned int)(i + 1),
+                   (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
+                   attempt.label);
+            printf("[SENSOR][RADIO] skip normal-only tx6/rx5 in receive mode (prefer tx5/rx6)\n");
+            continue;
+        }
+
+        if (attempt.startupInNormalModeOnly && requireRadioConfigReady)
+        {
+            printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
+                   (unsigned int)(i + 1),
+                   (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
+                   attempt.label);
+            printf("[SENSOR][RADIO] skip normal-only profile while config-ready is required\n");
+            continue;
+        }
+
+        printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
+               (unsigned int)(i + 1),
+               (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
+               attempt.label);
+
+        const E22900T30Config transceiverConfig = {
+            .startupInNormalModeOnly = attempt.startupInNormalModeOnly,
+            .serial = {
+                .uart = new Uart({
+                    .port = attempt.port,
+                    .baudRate = attempt.baud,
+                    .tx = attempt.tx,
+                    .rx = attempt.rx,
+                }),
+                .baudRate = attempt.baud,
+                .parity = E22900T30SerialParity::Parity_8N1},
+            .interupt = {.aux = attempt.aux, .expander = NULL},
+            .mode = {.m0 = attempt.m0, .m1 = attempt.m1, .expander = NULL},
+            .network = {
+                .id = 0,
+                .address = 0,
+                .airDataRate = E22900T30AirDataRate::Rate_9600,
+                .subPacketSize = E22900T30SubPacketSize::Size_240b,
+                .power = E22900T30Power::Power_21dBm,
+                .channel = 18,
+                .rssi = E22900T30RSSI::RSSI_Disabled,
+                .ambientNoise = E22900T30RSSIAmbientNoise::AmbientNoise_Disable,
+                .txmode = E22900T30TransmissionMode::TransmissionMode_Transparent,
+                .reply = E22900T30Reply::Reply_Disabled,
+                .lbt = E22900T30LBT::LBT_Disabled},
+            .security = {.encryptByteH = 0, .encryptByteL = 0},
+            .wor = {.mode = E22900T30WakeOnRadio::WOR_Receiver,
+                    .interval = E22900T30WakeOnRadioInterval::WOR_Interval_2000ms}};
+
+        E22900T30 *candidate = new E22900T30(transceiverConfig);
+        const bool acceptsNormalOnly = !requireRadioConfigReady && attempt.startupInNormalModeOnly;
+        if (candidate->Ready() && (!attempt.startupInNormalModeOnly || acceptsNormalOnly))
+        {
+            radio = candidate;
+            printf("[SENSOR][RADIO] selected: %s\n", attempt.label);
+            break;
+        }
+
+        printf("[SENSOR][RADIO] attempt failed: %s\n", attempt.label);
+        printf("[SENSOR][RADIO] cleanup candidate: %s\n", attempt.label);
+
+        delete candidate;
+        printf("[SENSOR][RADIO] cleanup done: %s\n", attempt.label);
+    }
+
+    if (!radio)
+    {
+        printf("[SENSOR][WARN] no radio init attempt succeeded\n");
+        return;
+    }
+
     SensorConfig config;
     config.rate = 30;                 // 60 Hz loop for tighter motion tracking.
-    config.ledGreen = (GpioNum)11;    // Optional heartbeat LED.
+    config.ledGreen = greenLedPin;
+    config.ledStatus = statusLedPin;
     config.ledRed = redLedPin;
     config.ledActiveLow = false;
     config.buzzer = (GpioNum)12;
     config.buzzerActiveLow = false;
-    config.printTelemetry = true;
+    config.printTelemetry = startInReceiveAlarm;
     config.telemetryIntervalMs = 0;   // Realtime telemetry (print each loop tick).
     config.detectionIrqThreshold = 1;
     config.detectionWindowMs = 500;
     config.detectionPulseMs = 500;
-    config.alarmDetectionCount = 2;
-    config.alarmDetectionWindowMs = 5000;
+    config.alarmDetectionCount = 3;
+    config.alarmDetectionWindowMs = 10000;
     config.alarmDurationMs = 60000;
-    config.alarmBlinkIntervalMs = 500;
+    config.alarmBlinkIntervalMs = 125; // 4 Hz active blink
+    config.armedBlinkIntervalMs = startInReceiveAlarm ? 1000 : SENSOR_ALARMSEND_STATUS_LED_BLINK_INTERVAL_MS;
+    config.armedBlinkOnMs = startInReceiveAlarm ? 500 : SENSOR_ALARMSEND_STATUS_LED_BLINK_ON_MS;
     config.noDetectionSleepMs = 10000;
-    config.sleep.enabled = true;
+    config.statusRadioIntervalMs = SENSOR_STATUS_HEARTBEAT_MS;
+    config.startInReceiveAlarm = startInReceiveAlarm;
+    config.sleep.enabled = !config.startInReceiveAlarm && (SENSOR_DEBUG == 0);
     config.sleep.wakePin = lis3dhInterruptPin;
     config.sleep.wakeOnLow = interruptActiveLow;
     config.sleep.mode = SleepMode::Light;
+    config.radioPacketLength = TRANSCEIVER_PACKAGE_SIZE;
     config.accelerometer = lis3dh;
     config.gps = gps;
+    config.transceiver = radio;
+
+    printf("[SENSOR][CFG] mode=%s statusIntervalMs=%u sleepEnabled=%u radioPacketLength=%u receiveTimeoutMs=%u\n",
+           config.startInReceiveAlarm ? "ReceiveAlarm" : "AlarmSend",
+           config.statusRadioIntervalMs,
+           config.sleep.enabled ? 1U : 0U,
+           (unsigned int)config.radioPacketLength,
+           config.receiveTimeoutMs);
+
+    if (config.startInReceiveAlarm)
+        printf("[SENSOR] mode=ReceiveAlarm (forced)\n");
+    else
+        printf("[SENSOR] mode=AlarmSend (forced)\n");
 
     Sensor sensor(config);
 

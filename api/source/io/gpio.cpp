@@ -15,6 +15,11 @@ static bool IsValidPin(GpioNum gpio)
     return GPIO_IS_VALID_GPIO((gpio_num_t)pin);
 }
 
+bool Gpio::IsValid(GpioNum gpio)
+{
+    return IsValidPin(gpio);
+}
+
 void Gpio::Reset(GpioNum gpio)
 {
     if (!IsValidPin(gpio))
