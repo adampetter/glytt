@@ -56,6 +56,12 @@
 #define SENSOR_RADIO_BAUDRATE UartBaudrate::UartBaudrate_9600
 #endif
 
+// Wake-on-radio interval used by both sender (WOR transmitter preamble cadence)
+// and receiver (WOR listening cadence). 2000 ms is a battery-first baseline.
+#ifndef SENSOR_RADIO_WOR_INTERVAL
+#define SENSOR_RADIO_WOR_INTERVAL E22900T30WakeOnRadioInterval::WOR_Interval_2000ms
+#endif
+
 // 0 = config-capable startup (preferred), 1 = normal-mode-only startup.
 #ifndef SENSOR_RADIO_STARTUP_NORMAL_ONLY
 #define SENSOR_RADIO_STARTUP_NORMAL_ONLY 0

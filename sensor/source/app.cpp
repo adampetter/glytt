@@ -149,7 +149,11 @@ extern "C" void app_main(void)
     }
 
     E22900T30 *radio = nullptr;
+    const bool startInReceiveAlarm = SENSOR_MODE == SENSOR_MODE_RECEIVE_ALARM;
     const bool requireRadioConfigReady = SENSOR_REQUIRE_RADIO_CONFIG_READY == 1;
+    const E22900T30WakeOnRadio worMode = startInReceiveAlarm
+                                             ? E22900T30WakeOnRadio::WOR_Receiver
+                                             : E22900T30WakeOnRadio::WOR_Transmitter;
     const E22900T30Config transceiverConfig = {
         .startupInNormalModeOnly = RadioStartupNormalOnly,
         .serial = {
@@ -176,10 +180,10 @@ extern "C" void app_main(void)
             .reply = E22900T30Reply::Reply_Disabled,
             .lbt = E22900T30LBT::LBT_Disabled},
         .security = {.encryptByteH = 0, .encryptByteL = 0},
-        .wor = {.mode = E22900T30WakeOnRadio::WOR_Receiver,
-                .interval = E22900T30WakeOnRadioInterval::WOR_Interval_2000ms}};
+            .wor = {.mode = worMode,
+                .interval = SENSOR_RADIO_WOR_INTERVAL}};
 
-    printf("[SENSOR][RADIO] init: uart=%u tx=%d rx=%d aux=%d m0=%d m1=%d baud=%u normalOnly=%u\n",
+            printf("[SENSOR][RADIO] init: uart=%u tx=%d rx=%d aux=%d m0=%d m1=%d baud=%u normalOnly=%u worMode=%u worInterval=%u\n",
            (unsigned int)RadioUartPort,
            (int)RadioTxPin,
            (int)RadioRxPin,
@@ -187,7 +191,9 @@ extern "C" void app_main(void)
            (int)radioModeM0Pin,
            (int)radioModeM1Pin,
            (unsigned int)RadioBaudrate,
-           RadioStartupNormalOnly ? 1U : 0U);
+               RadioStartupNormalOnly ? 1U : 0U,
+               (unsigned int)worMode,
+               (unsigned int)SENSOR_RADIO_WOR_INTERVAL);
 
     E22900T30 *candidate = new E22900T30(transceiverConfig);
     const bool acceptsNormalOnly = !requireRadioConfigReady && RadioStartupNormalOnly;
@@ -201,8 +207,6 @@ extern "C" void app_main(void)
         printf("[SENSOR][RADIO] init failed for primary profile\n");
         delete candidate;
     }
-
-    const bool startInReceiveAlarm = SENSOR_MODE == SENSOR_MODE_RECEIVE_ALARM;
 
     if (!radio)
     {
