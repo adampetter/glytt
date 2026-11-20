@@ -179,11 +179,12 @@ extern "C" void app_main(void)
             .txmode = E22900T30TransmissionMode::TransmissionMode_Transparent,
             .reply = E22900T30Reply::Reply_Disabled,
             .lbt = E22900T30LBT::LBT_Disabled},
-        .security = {.encryptByteH = 0, .encryptByteL = 0},
+        .security = {.encryptByteH = (Byte)SENSOR_RADIO_HW_ENCRYPT_BYTE_H,
+                     .encryptByteL = (Byte)SENSOR_RADIO_HW_ENCRYPT_BYTE_L},
             .wor = {.mode = worMode,
                 .interval = SENSOR_RADIO_WOR_INTERVAL}};
 
-            printf("[SENSOR][RADIO] init: uart=%u tx=%d rx=%d aux=%d m0=%d m1=%d baud=%u normalOnly=%u worMode=%u worInterval=%u\n",
+            printf("[SENSOR][RADIO] init: uart=%u tx=%d rx=%d aux=%d m0=%d m1=%d baud=%u normalOnly=%u worMode=%u worInterval=%u hwEnc=%u/%u\n",
            (unsigned int)RadioUartPort,
            (int)RadioTxPin,
            (int)RadioRxPin,
@@ -193,7 +194,9 @@ extern "C" void app_main(void)
            (unsigned int)RadioBaudrate,
                RadioStartupNormalOnly ? 1U : 0U,
                (unsigned int)worMode,
-               (unsigned int)SENSOR_RADIO_WOR_INTERVAL);
+               (unsigned int)SENSOR_RADIO_WOR_INTERVAL,
+               (unsigned int)((Byte)SENSOR_RADIO_HW_ENCRYPT_BYTE_H),
+               (unsigned int)((Byte)SENSOR_RADIO_HW_ENCRYPT_BYTE_L));
 
     E22900T30 *candidate = new E22900T30(transceiverConfig);
     const bool acceptsNormalOnly = !requireRadioConfigReady && RadioStartupNormalOnly;

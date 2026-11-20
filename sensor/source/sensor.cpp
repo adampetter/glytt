@@ -1,6 +1,7 @@
 ﻿#include "sensor.h"
 #include "config.h"
 #include "api/common/time.h"
+#include "api/security/aes256.h"
 #include "api/transmission/package.h"
 
 #include <cstdio>
@@ -11,9 +12,118 @@
 
 static const unsigned short AlarmPacketLength = 240;
 static const unsigned short AlarmPayloadMax = AlarmPacketLength - Package::HeaderSize;
+static const Byte PayloadFlagEncrypted = 0x80;
 static Byte AlarmPacketBuffer[AlarmPacketLength] = {0};
 static char AlarmPayloadBuffer[AlarmPayloadMax + 1] = {0};
 static char StatusPayloadBuffer[AlarmPayloadMax + 1] = {0};
+static const Byte Aes256KeyBytes[AES256_KEY_SIZE] = {SENSOR_AES256_KEY_BYTES};
+static const Byte Aes256IvBytes[AES256_IV_SIZE] = {SENSOR_AES256_IV_BYTES};
+
+static bool UseAppAes256()
+{
+    return SENSOR_AES256_ENABLE == 1;
+}
+
+static unsigned short Pkcs7PaddedLength(unsigned short length)
+{
+    unsigned short blocks = (unsigned short)(length / 16);
+    unsigned short paddedBlocks = (unsigned short)(blocks + 1);
+    return (unsigned short)(paddedBlocks * 16);
+}
+
+static bool EncryptPayloadForTransport(const Byte *plain,
+                                       unsigned short plainLength,
+                                       Byte *encrypted,
+                                       unsigned short encryptedCapacity,
+                                       unsigned short *encryptedLength)
+{
+    if (plain == nullptr || encrypted == nullptr || encryptedLength == nullptr)
+        return false;
+
+    if (!UseAppAes256())
+    {
+        if (plainLength > encryptedCapacity)
+            return false;
+
+        if (plainLength > 0)
+            memcpy(encrypted, plain, plainLength);
+
+        *encryptedLength = plainLength;
+        return true;
+    }
+
+    unsigned short paddedLength = Pkcs7PaddedLength(plainLength);
+    if (paddedLength > encryptedCapacity)
+        return false;
+
+    Byte padded[AlarmPayloadMax] = {0};
+    if (plainLength > 0)
+        memcpy(padded, plain, plainLength);
+
+    Byte padValue = (Byte)(paddedLength - plainLength);
+    for (unsigned short i = plainLength; i < paddedLength; i++)
+        padded[i] = padValue;
+
+    AES256 aes((Byte *)Aes256KeyBytes, (Byte *)Aes256IvBytes);
+    if (!aes.Ready())
+        return false;
+
+    (void)aes.Encrypt(padded, paddedLength, encrypted);
+    *encryptedLength = paddedLength;
+    return true;
+}
+
+static bool DecryptPayloadFromTransport(const Byte *encrypted,
+                                        unsigned short encryptedLength,
+                                        Byte *plain,
+                                        unsigned short plainCapacity,
+                                        unsigned short *plainLength)
+{
+    if (encrypted == nullptr || plain == nullptr || plainLength == nullptr)
+        return false;
+
+    if (!UseAppAes256())
+    {
+        if (encryptedLength > plainCapacity)
+            return false;
+
+        if (encryptedLength > 0)
+            memcpy(plain, encrypted, encryptedLength);
+
+        *plainLength = encryptedLength;
+        return true;
+    }
+
+    if (encryptedLength == 0 || (encryptedLength % 16) != 0 || encryptedLength > plainCapacity)
+        return false;
+
+    AES256 aes((Byte *)Aes256KeyBytes, (Byte *)Aes256IvBytes);
+    if (!aes.Ready())
+        return false;
+
+    Byte decrypted[AlarmPayloadMax] = {0};
+    (void)aes.Decrypt((Byte *)encrypted, encryptedLength, decrypted);
+
+    Byte padValue = decrypted[encryptedLength - 1];
+    if (padValue == 0 || padValue > 16 || padValue > encryptedLength)
+        return false;
+
+    for (unsigned short i = 0; i < padValue; i++)
+    {
+        if (decrypted[(unsigned short)(encryptedLength - 1 - i)] != padValue)
+            return false;
+    }
+
+    unsigned short unpaddedLength = (unsigned short)(encryptedLength - padValue);
+    if (unpaddedLength > plainCapacity)
+        return false;
+
+    if (unpaddedLength > 0)
+        memcpy(plain, decrypted, unpaddedLength);
+
+    *plainLength = unpaddedLength;
+    return true;
+}
 
 Sensor::Sensor(const SensorConfig &config)
     : Loop(config.rate), config(config), sleep(config.sleep)
@@ -649,20 +759,45 @@ void Sensor::SendAlarmPacket(unsigned long nowMs)
         return;
     }
 
-    unsigned short payloadLength = (unsigned short)payloadChars;
-    if (payloadLength > AlarmPayloadMax)
-        payloadLength = AlarmPayloadMax;
+    unsigned short plainPayloadLength = (unsigned short)payloadChars;
+    if (plainPayloadLength > AlarmPayloadMax)
+        plainPayloadLength = AlarmPayloadMax;
+
+    const bool useEncryptedPayload = UseAppAes256() && !this->config.startInReceiveAlarm;
+    Byte payloadToSend[AlarmPayloadMax] = {0};
+    unsigned short payloadLength = 0;
+    if (useEncryptedPayload)
+    {
+        if (!EncryptPayloadForTransport((const Byte *)AlarmPayloadBuffer,
+                                        plainPayloadLength,
+                                        payloadToSend,
+                                        sizeof(payloadToSend),
+                                        &payloadLength))
+        {
+            printf("[SENSOR][ALARM][PKG][ERROR] payload encryption failed plainLen=%u\n", (unsigned int)plainPayloadLength);
+            return;
+        }
+    }
+    else
+    {
+        memcpy(payloadToSend, AlarmPayloadBuffer, plainPayloadLength);
+        payloadLength = plainPayloadLength;
+    }
+
+    Byte headerFlags = location.fix ? 1 : 0;
+    if (useEncryptedPayload)
+        headerFlags = (Byte)(headerFlags | PayloadFlagEncrypted);
 
     memset(AlarmPacketBuffer, 0, sizeof(AlarmPacketBuffer));
     PackageHeader header;
     header.type = PackageType::Alarm;
     header.sequence = this->alarmPackageSequence++;
-    header.flags = location.fix ? 1 : 0;
+    header.flags = headerFlags;
     header.meta = (unsigned short)location.satellites;
 
     unsigned short written = 0;
     if (!Package::Encode(header,
-                         (const Byte *)AlarmPayloadBuffer,
+                         payloadToSend,
                          payloadLength,
                          AlarmPacketBuffer,
                          AlarmPacketLength,
@@ -672,12 +807,15 @@ void Sensor::SendAlarmPacket(unsigned long nowMs)
         return;
     }
 
-    printf("[SENSOR][ALARM][PKG] type=%u seq=%u bytes=%u payload=\"%.*s\"\n",
+        printf("[SENSOR][ALARM][PKG] type=%u seq=%u bytes=%u flags=0x%02X plain=\"%.*s\" payloadBytes=%u aes=%u\n",
            (unsigned int)header.type,
            (unsigned int)header.sequence,
            (unsigned int)written,
-           (int)payloadLength,
-           AlarmPayloadBuffer);
+            (unsigned int)header.flags,
+            (int)plainPayloadLength,
+            AlarmPayloadBuffer,
+            (unsigned int)payloadLength,
+            useEncryptedPayload ? 1U : 0U);
 
     if (this->config.transceiver == nullptr)
     {
@@ -730,20 +868,41 @@ void Sensor::SendStatusPacket(unsigned long nowMs)
         return;
     }
 
-    unsigned short payloadLength = (unsigned short)payloadChars;
-    if (payloadLength > AlarmPayloadMax)
-        payloadLength = AlarmPayloadMax;
+    unsigned short plainPayloadLength = (unsigned short)payloadChars;
+    if (plainPayloadLength > AlarmPayloadMax)
+        plainPayloadLength = AlarmPayloadMax;
+
+    const bool useEncryptedPayload = UseAppAes256() && !this->config.startInReceiveAlarm;
+    Byte payloadToSend[AlarmPayloadMax] = {0};
+    unsigned short payloadLength = 0;
+    if (useEncryptedPayload)
+    {
+        if (!EncryptPayloadForTransport((const Byte *)StatusPayloadBuffer,
+                                        plainPayloadLength,
+                                        payloadToSend,
+                                        sizeof(payloadToSend),
+                                        &payloadLength))
+        {
+            printf("[SENSOR][STATUS][PKG][ERROR] payload encryption failed plainLen=%u\n", (unsigned int)plainPayloadLength);
+            return;
+        }
+    }
+    else
+    {
+        memcpy(payloadToSend, StatusPayloadBuffer, plainPayloadLength);
+        payloadLength = plainPayloadLength;
+    }
 
     memset(AlarmPacketBuffer, 0, sizeof(AlarmPacketBuffer));
     PackageHeader header;
     header.type = PackageType::Status;
     header.sequence = this->alarmPackageSequence++;
-    header.flags = 0;
+    header.flags = useEncryptedPayload ? PayloadFlagEncrypted : 0;
     header.meta = 0;
 
     unsigned short written = 0;
     if (!Package::Encode(header,
-                         (const Byte *)StatusPayloadBuffer,
+                         payloadToSend,
                          payloadLength,
                          AlarmPacketBuffer,
                          AlarmPacketLength,
@@ -764,7 +923,16 @@ void Sensor::SendStatusPacket(unsigned long nowMs)
     }
 
     this->statusLastRadioAtMs = nowMs;
-    printf("[SENSOR][STATUS][TX] sent len=%u seq=%u\n",
+        printf("[SENSOR][STATUS][PKG] type=%u seq=%u bytes=%u flags=0x%02X plain=\"%.*s\" payloadBytes=%u aes=%u\n",
+            (unsigned int)header.type,
+            (unsigned int)header.sequence,
+            (unsigned int)written,
+            (unsigned int)header.flags,
+            (int)plainPayloadLength,
+            StatusPayloadBuffer,
+            (unsigned int)payloadLength,
+            useEncryptedPayload ? 1U : 0U);
+        printf("[SENSOR][STATUS][TX] sent len=%u seq=%u\n",
            (unsigned int)packetLength,
            (unsigned int)header.sequence);
 }
@@ -887,7 +1055,7 @@ bool Sensor::UpdateReceiveAlarm(unsigned long nowMs)
     static Byte payload[AlarmPacketLength] = {0};
     unsigned short payloadLength = 0;
     if (!Package::Decode(AlarmPacketBuffer,
-                         (unsigned short)received,
+                         packetLength,
                          &header,
                          payload,
                          sizeof(payload),
@@ -901,12 +1069,48 @@ bool Sensor::UpdateReceiveAlarm(unsigned long nowMs)
     this->lastRxAtMs = nowMs;
     this->rxPackets++;
 
+    Byte displayPayload[AlarmPayloadMax + 1] = {0};
+    unsigned short displayPayloadLength = payloadLength;
+    const bool encryptedPayload = (header.flags & PayloadFlagEncrypted) != 0;
+
+    if (encryptedPayload)
+    {
+        if (!DecryptPayloadFromTransport(payload,
+                                         payloadLength,
+                                         displayPayload,
+                                         AlarmPayloadMax,
+                                         &displayPayloadLength))
+        {
+            this->rxInvalid++;
+            printf("[SENSOR][RX][WARN] encrypted payload decrypt failed seq=%u payloadLen=%u\n",
+                   (unsigned int)header.sequence,
+                   (unsigned int)payloadLength);
+            return false;
+        }
+    }
+    else
+    {
+        if (payloadLength > AlarmPayloadMax)
+            return false;
+
+        if (payloadLength > 0)
+            memcpy(displayPayload, payload, payloadLength);
+        displayPayloadLength = payloadLength;
+    }
+
+    if (displayPayloadLength > AlarmPayloadMax)
+        displayPayloadLength = AlarmPayloadMax;
+    displayPayload[displayPayloadLength] = 0;
+
     if (header.type == PackageType::Alarm)
     {
         this->EnterAlarm(nowMs);
-        printf("[SENSOR][RX] alarm seq=%u payloadLen=%u\n",
+         printf("[SENSOR][RX] alarm seq=%u flags=0x%02X encrypted=%u payload=\"%.*s\"\n",
                (unsigned int)header.sequence,
-               (unsigned int)payloadLength);
+             (unsigned int)header.flags,
+             encryptedPayload ? 1U : 0U,
+             (int)displayPayloadLength,
+             (const char *)displayPayload);
         return true;
     }
 
@@ -918,16 +1122,22 @@ bool Sensor::UpdateReceiveAlarm(unsigned long nowMs)
             this->statusLed.SetSolidOn();
         }
 
-        printf("[SENSOR][RX] status seq=%u payloadLen=%u\n",
+         printf("[SENSOR][RX] status seq=%u flags=0x%02X encrypted=%u payload=\"%.*s\"\n",
                (unsigned int)header.sequence,
-               (unsigned int)payloadLength);
+             (unsigned int)header.flags,
+             encryptedPayload ? 1U : 0U,
+             (int)displayPayloadLength,
+             (const char *)displayPayload);
         return true;
     }
 
-    printf("[SENSOR][RX] type=%u seq=%u payloadLen=%u\n",
+        printf("[SENSOR][RX] type=%u seq=%u flags=0x%02X encrypted=%u payload=\"%.*s\"\n",
            (unsigned int)header.type,
            (unsigned int)header.sequence,
-           (unsigned int)payloadLength);
+            (unsigned int)header.flags,
+            encryptedPayload ? 1U : 0U,
+            (int)displayPayloadLength,
+            (const char *)displayPayload);
     return true;
 }
 

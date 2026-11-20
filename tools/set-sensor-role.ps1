@@ -1,7 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('disabled', 'sender', 'receiver')]
-    [string]$Role
+    [string]$Role,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$GenerateCryptoKey
 )
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -26,6 +29,44 @@ switch ($Role) {
     }
 }
 
+function New-ByteArrayHex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Length,
+
+        [int]$Minimum = 0,
+        [int]$Maximum = 256
+    )
+
+    $bytes = @()
+    for ($i = 0; $i -lt $Length; $i++) {
+        $value = Get-Random -Minimum $Minimum -Maximum $Maximum
+        $bytes += ('0x{0:X2}' -f $value)
+    }
+
+    return $bytes
+}
+
+function Convert-ToMacroLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Bytes,
+
+        [Parameter(Mandatory = $false)]
+        [int]$PerLine = 8
+    )
+
+    $lines = @()
+    for ($i = 0; $i -lt $Bytes.Count; $i += $PerLine) {
+        $end = [Math]::Min($i + $PerLine - 1, $Bytes.Count - 1)
+        $chunk = $Bytes[$i..$end] -join ', '
+        $suffix = if ($end -lt ($Bytes.Count - 1)) { ' \' } else { '' }
+        $lines += "    $chunk$suffix"
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
 $content = @"
 #pragma once
 
@@ -33,5 +74,34 @@ $content = @"
 #define SENSOR_MODE $modeMacro
 "@
 
+if ($GenerateCryptoKey) {
+    $keyBytes = New-ByteArrayHex -Length 32
+    $ivBytes = New-ByteArrayHex -Length 16
+    $hwBytes = New-ByteArrayHex -Length 2 -Minimum 1 -Maximum 256
+
+    $keyLines = Convert-ToMacroLines -Bytes $keyBytes -PerLine 8
+    $ivLines = Convert-ToMacroLines -Bytes $ivBytes -PerLine 8
+
+    $cryptoBlock = @"
+
+// Optional generated crypto override for this firmware build.
+#define SENSOR_AES256_KEY_BYTES \
+$keyLines
+
+#define SENSOR_AES256_IV_BYTES \
+$ivLines
+
+#define SENSOR_RADIO_HW_ENCRYPT_BYTE_H $($hwBytes[0])
+#define SENSOR_RADIO_HW_ENCRYPT_BYTE_L $($hwBytes[1])
+"@
+
+    $content += $cryptoBlock
+}
+
 Set-Content -Path $overridePath -Value $content -Encoding UTF8
-Write-Output "Sensor role set to $Role via $overridePath"
+if ($GenerateCryptoKey) {
+    Write-Output "Sensor role set to $Role via $overridePath (with generated crypto override)"
+}
+else {
+    Write-Output "Sensor role set to $Role via $overridePath (default crypto from config.h)"
+}
