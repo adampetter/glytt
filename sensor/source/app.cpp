@@ -12,9 +12,14 @@
 
 namespace
 {
-    constexpr GpioNum RadioAuxPin = (GpioNum)1;
-    constexpr GpioNum RadioModeM0Pin = (GpioNum)4;
-    constexpr GpioNum RadioModeM1Pin = (GpioNum)7;
+    constexpr UartPort RadioUartPort = SENSOR_RADIO_UART_PORT;
+    constexpr GpioNum RadioTxPin = (GpioNum)SENSOR_RADIO_TX_PIN;
+    constexpr GpioNum RadioRxPin = (GpioNum)SENSOR_RADIO_RX_PIN;
+    constexpr GpioNum RadioAuxPin = (GpioNum)SENSOR_RADIO_AUX_PIN;
+    constexpr GpioNum RadioModeM0Pin = (GpioNum)SENSOR_RADIO_M0_PIN;
+    constexpr GpioNum RadioModeM1Pin = (GpioNum)SENSOR_RADIO_M1_PIN;
+    constexpr UartBaudrate RadioBaudrate = SENSOR_RADIO_BAUDRATE;
+    constexpr bool RadioStartupNormalOnly = SENSOR_RADIO_STARTUP_NORMAL_ONLY == 1;
 }
 
 extern "C" void app_main(void)
@@ -44,18 +49,27 @@ extern "C" void app_main(void)
         return;
     }
 
-    if (!Gpio::IsValid(radioModeM0Pin) || !Gpio::IsValid(radioModeM1Pin))
+    if (!RadioStartupNormalOnly && (!Gpio::IsValid(radioModeM0Pin) || !Gpio::IsValid(radioModeM1Pin)))
     {
         printf("[SENSOR][RADIO][ERROR] Invalid mode pin mapping for this board. Pick two valid output GPIOs for M0/M1.\n");
         return;
     }
 
-    // Enforce deterministic startup mode for E22: normal mode (M0=0, M1=0).
-    Gpio::Mode(radioModeM0Pin, GpioMode::GpioMode_Input_Output);
-    Gpio::Mode(radioModeM1Pin, GpioMode::GpioMode_Input_Output);
-    Gpio::Write(radioModeM0Pin, false);
-    Gpio::Write(radioModeM1Pin, false);
-    delay(20);
+    if (RadioStartupNormalOnly && SENSOR_REQUIRE_RADIO_CONFIG_READY == 1)
+    {
+        printf("[SENSOR][RADIO][ERROR] SENSOR_RADIO_STARTUP_NORMAL_ONLY=1 conflicts with SENSOR_REQUIRE_RADIO_CONFIG_READY=1\n");
+        return;
+    }
+
+    if (!RadioStartupNormalOnly)
+    {
+        // Enforce deterministic startup mode for E22: normal mode (M0=0, M1=0).
+        Gpio::Mode(radioModeM0Pin, GpioMode::GpioMode_Input_Output);
+        Gpio::Mode(radioModeM1Pin, GpioMode::GpioMode_Input_Output);
+        Gpio::Write(radioModeM0Pin, false);
+        Gpio::Write(radioModeM1Pin, false);
+        delay(20);
+    }
 
     // IRQ sensitivity tuning:
     // Lower threshold + lower duration => more sensitive.
@@ -134,109 +148,61 @@ extern "C" void app_main(void)
         printf("[SENSOR][GPS][WARN] PA1010D not found at 0x%02X\n", PA1010D_I2C_DEFAULT_ADDRESS);
     }
 
-    struct RadioAttempt
-    {
-        UartPort port;
-        GpioNum tx;
-        GpioNum rx;
-        GpioNum aux;
-        GpioNum m0;
-        GpioNum m1;
-        UartBaudrate baud;
-        bool startupInNormalModeOnly;
-        const char *label;
-    };
-
-    const RadioAttempt attempts[] = {
-        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 cfg-noaux 9600"},
-        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, radioModeM1Pin, radioModeM0Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 cfg-noaux-swap 9600"},
-        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, GPIO_NONE, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx5/rx6 cfg-noaux 9600"},
-        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx6/rx5 normal-only 9600"},
-        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx5/rx6 normal-only 9600"},
-        {UartPort::UartPort_1, (GpioNum)43, (GpioNum)44, GPIO_NONE, GPIO_NONE, GPIO_NONE, UartBaudrate::UartBaudrate_9600, true, "uart1 tx43/rx44 normal-only 9600"},
-        {UartPort::UartPort_1, (GpioNum)6, (GpioNum)5, radioAuxPin, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx6/rx5 aux cfg 9600"},
-        {UartPort::UartPort_1, (GpioNum)5, (GpioNum)6, radioAuxPin, radioModeM0Pin, radioModeM1Pin, UartBaudrate::UartBaudrate_9600, false, "uart1 tx5/rx6 aux cfg 9600"},
-    };
-
     E22900T30 *radio = nullptr;
-    const bool startInReceiveAlarm = SENSOR_MODE == SENSOR_MODE_RECEIVE_ALARM;
     const bool requireRadioConfigReady = SENSOR_REQUIRE_RADIO_CONFIG_READY == 1;
-    for (unsigned int i = 0; i < (sizeof(attempts) / sizeof(attempts[0])); i++)
+    const E22900T30Config transceiverConfig = {
+        .startupInNormalModeOnly = RadioStartupNormalOnly,
+        .serial = {
+            .uart = new Uart({
+                .port = RadioUartPort,
+                .baudRate = RadioBaudrate,
+                .tx = RadioTxPin,
+                .rx = RadioRxPin,
+            }),
+            .baudRate = RadioBaudrate,
+            .parity = E22900T30SerialParity::Parity_8N1},
+        .interupt = {.aux = radioAuxPin, .expander = NULL},
+        .mode = {.m0 = radioModeM0Pin, .m1 = radioModeM1Pin, .expander = NULL},
+        .network = {
+            .id = 0,
+            .address = 0,
+            .airDataRate = E22900T30AirDataRate::Rate_9600,
+            .subPacketSize = E22900T30SubPacketSize::Size_240b,
+            .power = E22900T30Power::Power_21dBm,
+            .channel = 18,
+            .rssi = E22900T30RSSI::RSSI_Disabled,
+            .ambientNoise = E22900T30RSSIAmbientNoise::AmbientNoise_Disable,
+            .txmode = E22900T30TransmissionMode::TransmissionMode_Transparent,
+            .reply = E22900T30Reply::Reply_Disabled,
+            .lbt = E22900T30LBT::LBT_Disabled},
+        .security = {.encryptByteH = 0, .encryptByteL = 0},
+        .wor = {.mode = E22900T30WakeOnRadio::WOR_Receiver,
+                .interval = E22900T30WakeOnRadioInterval::WOR_Interval_2000ms}};
+
+    printf("[SENSOR][RADIO] init: uart=%u tx=%d rx=%d aux=%d m0=%d m1=%d baud=%u normalOnly=%u\n",
+           (unsigned int)RadioUartPort,
+           (int)RadioTxPin,
+           (int)RadioRxPin,
+           (int)radioAuxPin,
+           (int)radioModeM0Pin,
+           (int)radioModeM1Pin,
+           (unsigned int)RadioBaudrate,
+           RadioStartupNormalOnly ? 1U : 0U);
+
+    E22900T30 *candidate = new E22900T30(transceiverConfig);
+    const bool acceptsNormalOnly = !requireRadioConfigReady && RadioStartupNormalOnly;
+    if (candidate->Ready() && (!RadioStartupNormalOnly || acceptsNormalOnly))
     {
-        const RadioAttempt &attempt = attempts[i];
-
-        if (startInReceiveAlarm &&
-            attempt.startupInNormalModeOnly &&
-            attempt.tx == (GpioNum)6 &&
-            attempt.rx == (GpioNum)5)
-        {
-            printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
-                   (unsigned int)(i + 1),
-                   (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
-                   attempt.label);
-            printf("[SENSOR][RADIO] skip normal-only tx6/rx5 in receive mode (prefer tx5/rx6)\n");
-            continue;
-        }
-
-        if (attempt.startupInNormalModeOnly && requireRadioConfigReady)
-        {
-            printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
-                   (unsigned int)(i + 1),
-                   (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
-                   attempt.label);
-            printf("[SENSOR][RADIO] skip normal-only profile while config-ready is required\n");
-            continue;
-        }
-
-        printf("[SENSOR][RADIO] init attempt %u/%u: %s\n",
-               (unsigned int)(i + 1),
-               (unsigned int)(sizeof(attempts) / sizeof(attempts[0])),
-               attempt.label);
-
-        const E22900T30Config transceiverConfig = {
-            .startupInNormalModeOnly = attempt.startupInNormalModeOnly,
-            .serial = {
-                .uart = new Uart({
-                    .port = attempt.port,
-                    .baudRate = attempt.baud,
-                    .tx = attempt.tx,
-                    .rx = attempt.rx,
-                }),
-                .baudRate = attempt.baud,
-                .parity = E22900T30SerialParity::Parity_8N1},
-            .interupt = {.aux = attempt.aux, .expander = NULL},
-            .mode = {.m0 = attempt.m0, .m1 = attempt.m1, .expander = NULL},
-            .network = {
-                .id = 0,
-                .address = 0,
-                .airDataRate = E22900T30AirDataRate::Rate_9600,
-                .subPacketSize = E22900T30SubPacketSize::Size_240b,
-                .power = E22900T30Power::Power_21dBm,
-                .channel = 18,
-                .rssi = E22900T30RSSI::RSSI_Disabled,
-                .ambientNoise = E22900T30RSSIAmbientNoise::AmbientNoise_Disable,
-                .txmode = E22900T30TransmissionMode::TransmissionMode_Transparent,
-                .reply = E22900T30Reply::Reply_Disabled,
-                .lbt = E22900T30LBT::LBT_Disabled},
-            .security = {.encryptByteH = 0, .encryptByteL = 0},
-            .wor = {.mode = E22900T30WakeOnRadio::WOR_Receiver,
-                    .interval = E22900T30WakeOnRadioInterval::WOR_Interval_2000ms}};
-
-        E22900T30 *candidate = new E22900T30(transceiverConfig);
-        const bool acceptsNormalOnly = !requireRadioConfigReady && attempt.startupInNormalModeOnly;
-        if (candidate->Ready() && (!attempt.startupInNormalModeOnly || acceptsNormalOnly))
-        {
-            radio = candidate;
-            printf("[SENSOR][RADIO] selected: %s\n", attempt.label);
-            break;
-        }
-
-        printf("[SENSOR][RADIO] attempt failed: %s\n", attempt.label);
-        printf("[SENSOR][RADIO] cleanup candidate: %s\n", attempt.label);
-
-        delete candidate;
-        printf("[SENSOR][RADIO] cleanup done: %s\n", attempt.label);
+        radio = candidate;
+        printf("[SENSOR][RADIO] selected primary profile\n");
     }
+    else
+    {
+        printf("[SENSOR][RADIO] init failed for primary profile\n");
+        delete candidate;
+    }
+
+    const bool startInReceiveAlarm = SENSOR_MODE == SENSOR_MODE_RECEIVE_ALARM;
 
     if (!radio)
     {

@@ -27,6 +27,40 @@
 #define SENSOR_MODE SENSOR_MODE_DISABLED
 #endif
 
+// Primary radio profile for this hardware. Override in sensor/include/override.h when needed.
+#ifndef SENSOR_RADIO_UART_PORT
+#define SENSOR_RADIO_UART_PORT UartPort::UartPort_1
+#endif
+
+#ifndef SENSOR_RADIO_TX_PIN
+#define SENSOR_RADIO_TX_PIN 6
+#endif
+
+#ifndef SENSOR_RADIO_RX_PIN
+#define SENSOR_RADIO_RX_PIN 5
+#endif
+
+#ifndef SENSOR_RADIO_AUX_PIN
+#define SENSOR_RADIO_AUX_PIN GPIO_NONE
+#endif
+
+#ifndef SENSOR_RADIO_M0_PIN
+#define SENSOR_RADIO_M0_PIN 4
+#endif
+
+#ifndef SENSOR_RADIO_M1_PIN
+#define SENSOR_RADIO_M1_PIN 7
+#endif
+
+#ifndef SENSOR_RADIO_BAUDRATE
+#define SENSOR_RADIO_BAUDRATE UartBaudrate::UartBaudrate_9600
+#endif
+
+// 0 = config-capable startup (preferred), 1 = normal-mode-only startup.
+#ifndef SENSOR_RADIO_STARTUP_NORMAL_ONLY
+#define SENSOR_RADIO_STARTUP_NORMAL_ONLY 0
+#endif
+
 // 1 = require successful registry/config-capable radio init (skip normal-only fallback)
 // 0 = allow startupInNormalModeOnly attempts
 #define SENSOR_REQUIRE_RADIO_CONFIG_READY 1
